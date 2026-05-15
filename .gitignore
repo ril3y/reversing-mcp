@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.egg
+
+# Java / Gradle
+.gradle/
+build/
+*.class
+*.jar
+
+# Ghidra extension build artifacts
+ghidra/ghidra-mcp-bridge/.gradle/
+ghidra/ghidra-mcp-bridge/build/
+ghidra/ghidra-mcp-bridge/dist/
+ghidra/ghidra-mcp-bridge/lib/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

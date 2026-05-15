@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""
+MCP server for IDA Pro — proxies Claude Code tool calls to IDA HTTP plugin(s).
+
+Usage:
+    python ida/mcp_server.py              # stdio mode for Claude Code
+    python ida/mcp_server.py --list       # list active instances
+"""
+
+import os
+import sys
+
+# Allow imports from parent directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from mcp.server.fastmcp import FastMCP
+
+from common import call_instance, discover_instances, list_instances_text
+
+REG_DIR = os.path.expanduser("~/.ida_mcp")
+TOOL = "IDA"
+NAME_KEYS = ("idb", "idb_path")
+
+mcp = FastMCP("ida")
+
+
+def _call(endpoint, body=None, idb=None):
+    return call_instance(REG_DIR, endpoint, body, target=idb,
+                         tool_name=TOOL, name_keys=NAME_KEYS, timeout=30)
+
+
+@mcp.tool()
+def list_instances() -> str:
+    """List all active IDA instances with their loaded IDBs."""
+    return list_instances_text(REG_DIR, TOOL, name_key="idb")
+
+
+@mcp.tool()
+def idb_info(idb: str = "") -> dict:
+    """Get basic info about a loaded IDB (functions, segments, processor, bits).
+
+    Args:
+        idb: IDB filename substring to target a specific instance (optional)
+    """
+    return _call("/info", idb=idb or None)
+
+
+@mcp.tool()
+def get_function(address: str = "", name: str = "", idb: str = "") -> dict:
+    """Get function info (name, start, end, size) by address or name.
+
+    Args:
+        address: Function address (hex)
+        name: Function name or substring
+        idb: IDB filename substring to target (optional)
+    """
+    body = {}
+    if address: body["address"] = address
+    if name: body["name"] = name
+    return _call("/function", body, idb=idb or None)
+
+
+@mcp.tool()
+def disassemble(address: str = "", name: str = "", start: str = "", end: str = "", idb: str = "") -> dict:
+    """Disassemble a function or address range.
+
+    Args:
+        address: Function address to disassemble
+        name: Function name to disassemble
+        start: Start address for range disassembly
+        end: End address for range disassembly
+        idb: IDB filename substring to target (optional)
+    """
+    body = {}
+    if address: body["address"] = address
+    if name: body["name"] = name
+    if start: body["start"] = start
+    if end: body["end"] = end
+    return _call("/disassemble", body, idb=idb or None)
+
+
+@mcp.tool()
+def decompile(address: str = "", name: str = "", idb: str = "") -> dict:
+    """Decompile a function to pseudocode using Hex-Rays.
+
+    Args:
+        address: Function address
+        name: Function name
+        idb: IDB filename substring to target (optional)
+    """
+    body = {}
+    if address: body["address"] = address
+    if name: body["name"] = name
+    return _call("/decompile", body, idb=idb or None)
+
+
+@mcp.tool()
+def xrefs_to(address: str = "", name: str = "", idb: str = "") -> dict:
+    """Get all cross-references TO an address or function.
+
+    Args:
+        address: Target address
+        name: Function name
+        idb: IDB filename substring to target (optional)
+    """
+    body = {}
+    if address: body["address"] = address
+    if name: body["name"] = name
+    return _call("/xrefs_to", body, idb=idb or None)
+
+
+@mcp.tool()
+def xrefs_from(address: str, idb: str = "") -> dict:
+    """Get all cross-references FROM an address.
+
+    Args:
+        address: Source address
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/xrefs_from", {"address": address}, idb=idb or None)
+
+
+@mcp.tool()
+def get_callers(address: str = "", name: str = "", idb: str = "") -> dict:
+    """Get all functions that call a given function.
+
+    Args:
+        address: Function address
+        name: Function name
+        idb: IDB filename substring to target (optional)
+    """
+    body = {}
+    if address: body["address"] = address
+    if name: body["name"] = name
+    return _call("/callers", body, idb=idb or None)
+
+
+@mcp.tool()
+def get_callees(address: str = "", name: str = "", idb: str = "") -> dict:
+    """Get all functions called by a given function.
+
+    Args:
+        address: Function address
+        name: Function name
+        idb: IDB filename substring to target (optional)
+    """
+    body = {}
+    if address: body["address"] = address
+    if name: body["name"] = name
+    return _call("/callees", body, idb=idb or None)
+
+
+@mcp.tool()
+def search_functions(pattern: str, idb: str = "") -> dict:
+    """Search function names by substring (case-insensitive, max 100 results).
+
+    Args:
+        pattern: Substring to search for in function names
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/search_functions", {"pattern": pattern}, idb=idb or None)
+
+
+@mcp.tool()
+def search_strings(pattern: str, idb: str = "") -> dict:
+    """Search strings in the IDB by substring (max 100 results).
+
+    Args:
+        pattern: Substring to search for
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/search_strings", {"pattern": pattern}, idb=idb or None)
+
+
+@mcp.tool()
+def get_segments(idb: str = "") -> dict:
+    """List all memory segments in the IDB.
+
+    Args:
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/segments", idb=idb or None)
+
+
+@mcp.tool()
+def get_bytes(address: str, size: int = 256, idb: str = "") -> dict:
+    """Read raw bytes from the IDB at an address.
+
+    Args:
+        address: Start address (hex)
+        size: Number of bytes to read (max 4096)
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/bytes", {"address": address, "size": size}, idb=idb or None)
+
+
+@mcp.tool()
+def rename(address: str, name: str, idb: str = "") -> dict:
+    """Rename a function or address in the IDB.
+
+    Args:
+        address: Address to rename (hex)
+        name: New name
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/rename", {"address": address, "name": name}, idb=idb or None)
+
+
+@mcp.tool()
+def add_comment(address: str, comment: str, repeatable: bool = False, idb: str = "") -> dict:
+    """Add a comment at an address in the IDB.
+
+    Args:
+        address: Address (hex)
+        comment: Comment text
+        repeatable: If True, comment shows at all xrefs
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/comment", {"address": address, "comment": comment, "repeatable": repeatable}, idb=idb or None)
+
+
+@mcp.tool()
+def create_function(address: str, end: str = "", idb: str = "") -> dict:
+    """Create a function at an address.
+
+    Args:
+        address: Start address (hex)
+        end: Optional end address (hex)
+        idb: IDB filename substring to target (optional)
+    """
+    body = {"address": address}
+    if end: body["end"] = end
+    return _call("/create_function", body, idb=idb or None)
+
+
+@mcp.tool()
+def delete_function(address: str, idb: str = "") -> dict:
+    """Delete a function at an address.
+
+    Args:
+        address: Function address (hex)
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/delete_function", {"address": address}, idb=idb or None)
+
+
+@mcp.tool()
+def make_code(address: str, size: int = 0, idb: str = "") -> dict:
+    """Force bytes to be analyzed as code.
+
+    Args:
+        address: Start address (hex)
+        size: Number of bytes to convert (0 = single instruction)
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/make_code", {"address": address, "size": size}, idb=idb or None)
+
+
+@mcp.tool()
+def find_micromips_prologues(idb: str = "") -> dict:
+    """Scan for microMIPS function prologues in data regions.
+
+    Args:
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/find_micromips_prologues", {}, idb=idb or None)
+
+
+if __name__ == "__main__":
+    if "--list" in sys.argv:
+        instances = discover_instances(REG_DIR)
+        if not instances:
+            print("No active IDA instances.")
+        else:
+            print(f"{len(instances)} active instance(s):")
+            for inst in instances:
+                print(f"  port:{inst['port']}  pid:{inst.get('pid','?')}  idb:{inst.get('idb','?')}")
+                print(f"    path: {inst.get('idb_path', '?')}")
+    else:
+        mcp.run(transport="stdio")
