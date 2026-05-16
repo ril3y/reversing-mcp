@@ -539,6 +539,134 @@ def get_idb_info():
 
 
 # ---------------------------------------------------------------------------
+# Types / structs / function prototypes
+# ---------------------------------------------------------------------------
+
+def define_type(decl):
+    """Parse one or more C declarations into the IDB type library.
+
+    Accepts struct/union/typedef/function declarations. ``decl`` is a
+    self-contained chunk of C source (multiple declarations allowed).
+    Returns the count of parse errors (0 == full success).
+    """
+    if not decl:
+        return {"success": False, "error": "Empty declaration"}
+
+    flags = ida_typeinf.PT_FILE | ida_typeinf.PT_SIL
+    errors = ida_typeinf.parse_decls(None, decl, None, flags)
+    if errors:
+        _mcp_log(f"DEFINE TYPE: {errors} parse error(s)")
+        return {"success": False, "parse_errors": errors,
+                "error": f"{errors} parsing error(s); check IDA Output window"}
+    _mcp_log(f"DEFINE TYPE: parsed ({len(decl)} bytes)")
+    return {"success": True, "size": len(decl)}
+
+
+def apply_type_at(addr, type_decl):
+    """Apply a type (struct, var, or function prototype) at an address.
+
+    `type_decl` can be:
+      - A named type:        ``"MyStruct"``         (wrapped into ``MyStruct x;``)
+      - An inline var decl:  ``"unsigned int v;"``
+      - A function proto:    ``"void __fastcall foo(int a, char *b);"``
+    """
+    decl = type_decl.strip()
+    # If user passed a bare type name, wrap into a variable decl.
+    if ';' not in decl and '(' not in decl:
+        decl = f"{decl} x;"
+    elif not decl.endswith(';'):
+        decl += ';'
+
+    ok = idc.SetType(addr, decl)
+    if ok:
+        _mcp_log(f"APPLY TYPE 0x{addr:08X}: {type_decl}", addr)
+    else:
+        _mcp_log(f"APPLY TYPE 0x{addr:08X}: FAILED for: {type_decl}")
+    return {"success": bool(ok), "address": f"0x{addr:08X}", "type": type_decl}
+
+
+def set_function_prototype_at(addr, proto):
+    """Set a function's prototype (calling convention + return + args)."""
+    decl = proto.strip()
+    if not decl.endswith(';'):
+        decl += ';'
+    ok = idc.SetType(addr, decl)
+    if ok:
+        _mcp_log(f"SET PROTO 0x{addr:08X}: {proto}", addr)
+    else:
+        _mcp_log(f"SET PROTO 0x{addr:08X}: FAILED")
+    return {"success": bool(ok), "address": f"0x{addr:08X}", "prototype": proto}
+
+
+# ---------------------------------------------------------------------------
+# Memory segments
+# ---------------------------------------------------------------------------
+
+def _perms_string_to_bits(s):
+    """Map 'rwx' subset to IDA's segment.perm bitmask. R=4, W=2, X=1."""
+    p = 0
+    if 'r' in s.lower(): p |= 4
+    if 'w' in s.lower(): p |= 2
+    if 'x' in s.lower(): p |= 1
+    return p
+
+
+def add_segment_at(start, end, name, perms_str="rwx", sclass="DATA"):
+    """Create a new memory segment.
+
+    perms_str: 'r', 'w', 'x' subset (e.g. 'rw', 'rx', 'rwx').
+    sclass:    'CODE' | 'DATA' | 'BSS' | 'XTRN' | 'CONST' | 'STACK'.
+    """
+    # add_segm_ex(start, end, base, use32, align, comb, flags)
+    # use32=1 means 32-bit addressing IFF 64-bit base is irrelevant for x64;
+    # ADDSEG_OR_DIE makes it fail loudly on overlap.
+    ok = idc.add_segm_ex(start, end, 0, 1,
+                         idc.saAbs, idc.scPub, idc.ADDSEG_OR_DIE)
+    if not ok:
+        _mcp_log(f"ADD SEGMENT 0x{start:08X}-0x{end:08X}: FAILED (overlap?)")
+        return {"success": False,
+                "error": "add_segm_ex failed (likely overlaps existing segment)"}
+
+    seg = ida_segment.getseg(start)
+    if not seg:
+        return {"success": False, "error": "Segment created but not findable"}
+
+    ida_segment.set_segm_name(seg, name)
+    ida_segment.set_segm_class(seg, sclass)
+    seg.perm = _perms_string_to_bits(perms_str)
+    seg.update()
+
+    _mcp_log(f"ADD SEGMENT 0x{start:08X}-0x{end:08X} ({name}, {perms_str}, {sclass})", start)
+    return {"success": True, "start": f"0x{start:08X}", "end": f"0x{end:08X}",
+            "name": name, "perms": perms_str, "class": sclass}
+
+
+def set_segment_attrs_at(addr, name=None, perms_str=None, sclass=None):
+    """Modify attributes of the segment containing addr."""
+    seg = ida_segment.getseg(addr)
+    if not seg:
+        return {"success": False, "error": f"No segment at 0x{addr:08X}"}
+
+    changes = []
+    if name is not None and name != "":
+        ida_segment.set_segm_name(seg, name)
+        changes.append(f"name={name}")
+    if perms_str is not None and perms_str != "":
+        seg.perm = _perms_string_to_bits(perms_str)
+        seg.update()
+        changes.append(f"perms={perms_str}")
+    if sclass is not None and sclass != "":
+        ida_segment.set_segm_class(seg, sclass)
+        changes.append(f"class={sclass}")
+
+    if not changes:
+        return {"success": False, "error": "Nothing to change (provide name/perms/class)"}
+
+    _mcp_log(f"SET SEGMENT 0x{addr:08X}: {', '.join(changes)}", addr)
+    return {"success": True, "address": f"0x{addr:08X}", "changes": changes}
+
+
+# ---------------------------------------------------------------------------
 # HTTP request handler
 # ---------------------------------------------------------------------------
 
@@ -739,6 +867,49 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 
         elif path == "/find_micromips_prologues":
             return {"prologues": find_micromips_prologues()}
+
+        elif path == "/define_type":
+            decl = body.get("decl", "")
+            if not decl:
+                return {"error": "Provide 'decl'"}
+            return define_type(decl)
+
+        elif path == "/apply_type":
+            addr_str = body.get("address")
+            type_decl = body.get("type")
+            if addr_str and type_decl:
+                return apply_type_at(_parse_addr(addr_str), type_decl)
+            return {"error": "Provide 'address' and 'type'"}
+
+        elif path == "/set_function_prototype":
+            addr_str = body.get("address")
+            proto = body.get("prototype")
+            if addr_str and proto:
+                return set_function_prototype_at(_parse_addr(addr_str), proto)
+            return {"error": "Provide 'address' and 'prototype'"}
+
+        elif path == "/add_segment":
+            start_str = body.get("start")
+            end_str = body.get("end")
+            name = body.get("name", "")
+            perms = body.get("perms", "rwx")
+            sclass = body.get("class", "DATA")
+            if start_str and end_str and name:
+                return add_segment_at(_parse_addr(start_str),
+                                      _parse_addr(end_str),
+                                      name, perms, sclass)
+            return {"error": "Provide 'start', 'end', and 'name'"}
+
+        elif path == "/set_segment_attrs":
+            addr_str = body.get("address")
+            if addr_str:
+                return set_segment_attrs_at(
+                    _parse_addr(addr_str),
+                    name=body.get("name"),
+                    perms_str=body.get("perms"),
+                    sclass=body.get("class"),
+                )
+            return {"error": "Provide 'address'"}
 
         else:
             return {"error": f"Unknown endpoint: {path}"}

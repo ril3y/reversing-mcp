@@ -266,6 +266,89 @@ def find_micromips_prologues(idb: str = "") -> dict:
     return _call("/find_micromips_prologues", {}, idb=idb or None)
 
 
+@mcp.tool()
+def define_type(decl: str, idb: str = "") -> dict:
+    """Parse C struct/union/typedef/function declarations into the IDB type library.
+
+    Multiple declarations in one call are supported. The parsed types become
+    available to apply_type / set_function_prototype.
+
+    Args:
+        decl: C source. Example:
+              'struct CaptureCmd { uint32_t cmd_id; uint16_t channel_mask; uint16_t sample_rate_div; };'
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/define_type", {"decl": decl}, idb=idb or None)
+
+
+@mcp.tool()
+def apply_type(address: str, type: str, idb: str = "") -> dict:
+    """Apply a type to an address (struct overlay, variable type, etc.).
+
+    Args:
+        address: Target address (hex).
+        type: Either a named type (e.g. 'CaptureCmd') or an inline C
+              declaration (e.g. 'unsigned int sample_count;').
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/apply_type", {"address": address, "type": type}, idb=idb or None)
+
+
+@mcp.tool()
+def set_function_prototype(address: str, prototype: str, idb: str = "") -> dict:
+    """Set a function's prototype (calling convention + return type + args).
+
+    Args:
+        address: Function start address (hex).
+        prototype: Full C function declaration including calling convention.
+                   Example: 'void __fastcall Write(void *self, void *ep, unsigned char *buf, unsigned int size);'
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/set_function_prototype",
+                 {"address": address, "prototype": prototype},
+                 idb=idb or None)
+
+
+@mcp.tool()
+def add_segment(start: str, end: str, name: str, perms: str = "rwx",
+                sclass: str = "DATA", idb: str = "") -> dict:
+    """Create a new memory segment in the IDB.
+
+    Args:
+        start: Start address (hex, inclusive).
+        end: End address (hex, exclusive).
+        name: Segment name (e.g. 'MMIO_UART', 'SRAM').
+        perms: Permissions — any subset of 'r', 'w', 'x' (default 'rwx').
+        sclass: Segment class — 'CODE' | 'DATA' | 'BSS' | 'XTRN' | 'CONST' | 'STACK'.
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/add_segment",
+                 {"start": start, "end": end, "name": name,
+                  "perms": perms, "class": sclass},
+                 idb=idb or None)
+
+
+@mcp.tool()
+def set_segment_attrs(address: str, name: str = "", perms: str = "",
+                      sclass: str = "", idb: str = "") -> dict:
+    """Modify attributes (name/perms/class) of the segment containing the address.
+
+    Only fields you pass are changed. Empty strings are ignored.
+
+    Args:
+        address: Any address inside the target segment (hex).
+        name: New segment name (optional).
+        perms: New permissions string (optional).
+        sclass: New segment class (optional).
+        idb: IDB filename substring to target (optional)
+    """
+    body: dict = {"address": address}
+    if name:   body["name"] = name
+    if perms:  body["perms"] = perms
+    if sclass: body["class"] = sclass
+    return _call("/set_segment_attrs", body, idb=idb or None)
+
+
 if __name__ == "__main__":
     if "--list" in sys.argv:
         instances = discover_instances(REG_DIR)
