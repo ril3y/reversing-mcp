@@ -7,7 +7,18 @@ self-contained chunk of work — pick whatever's highest leverage.
 Effort estimates assume working in-tree with the existing patterns:
 **S** = under 100 LOC, ~1 hour · **M** = 100–500 LOC, ~half a day · **L** = full feature, ~1+ days.
 
-## ★ Top priority: IDA debugger integration
+## ✅ Shipped this session: IDA debugger integration
+
+22 new endpoints (`dbg_state`, `dbg_attach`/`launch`/`detach`/`terminate`,
+`dbg_continue`/`pause`/`run`, `dbg_step_into`/`over`/`out`,
+`dbg_run_until_ret`, `dbg_run_to`, `dbg_set/del/list_breakpoint(s)`,
+`dbg_read/write_memory`, `dbg_get/set_reg`/`get_regs`, `dbg_wait_event`,
+`dbg_callstack`/`threads`/`modules`) plus Hex-Rays local-var endpoints
+(`rename_local_var`, `set_local_var_type`). Verification target — the
+Saleae buffer-capture flow described below — is the next session's first
+task. Original design notes preserved below for context.
+
+## ★ Original proposal: IDA debugger integration
 
 IDA has a full built-in debugger (Windows/Linux/macOS, local + remote, every
 arch IDA supports). Wiring it into the bridge unlocks **dynamic analysis** —
