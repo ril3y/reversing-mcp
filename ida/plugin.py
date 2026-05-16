@@ -11,10 +11,13 @@ Supports multiple simultaneous IDA instances (different IDBs).
 import http.server
 import json
 import os
+import re
 import socket
 import threading
+import time
 import traceback
 from datetime import datetime, timezone
+from html import escape as html_escape
 
 import ida_auto
 import ida_bytes
@@ -68,12 +71,19 @@ def _run_on_main_thread(func, *args, **kwargs):
     This never deadlocks because we never call execute_sync.
 
     If the request stays queued for >5 s we log a warning to IDA's
-    Output window — the most common cause is a modal dialog blocking
-    IDA's main thread (e.g. "save changes? Y/N", a Hex-Rays warning,
-    or "type already exists, overwrite?"). idc.batch(1) wrapping in
-    _MainThreadTimer._tick suppresses most of these, but anything that
-    leaks through is now visible.
+    Output window — common causes:
+      - a modal dialog blocking the main thread (Hex-Rays warning,
+        "save changes?", "type already exists, overwrite?")
+      - a previous Hex-Rays call chewing on an obfuscated function
+      - the viewer's QTimer doing slow work (e.g. live decompile macros)
+    idc.batch(1) wrapping in _MainThreadTimer._tick suppresses dialogs,
+    but the other two cases are visible as queue-wait warnings.
+
+    The label argument (if provided in kwargs as `_mcp_label`) is included
+    in the warning so the user can identify which request stalled.
     """
+    label = kwargs.pop("_mcp_label", None) or getattr(func, "__name__", repr(func))
+
     result = [None]
     error = [None]
     done = threading.Event()
@@ -84,12 +94,11 @@ def _run_on_main_thread(func, *args, **kwargs):
 
     # Wait for the timer to process our request; surface a warning after 5s.
     if not done.wait(timeout=5.0):
-        fn_name = getattr(func, "__name__", repr(func))
         ida_kernwin.msg(
-            f"[MCP] WARNING: {fn_name} queued for >5s — "
-            f"check for a modal dialog blocking IDA's main thread.\n"
+            f"[MCP] WARNING: '{label}' queued for >5s — main thread busy "
+            f"(modal dialog? slow Hex-Rays call? viewer macro decompile?).\n"
         )
-        done.wait()  # block until the dialog is dismissed and the timer fires
+        done.wait()  # block until the timer fires
 
     if error[0] is not None:
         raise error[0]
@@ -801,10 +810,84 @@ def _auto_suspend_and_run(fn):
 
 # ---- attach / launch / detach ----
 
+_DOPT_EXCDLG_MASK = 0x3000   # bits controlling exception-dialog mode
+_EXCDLG_NEVER    = 0x0000   # never show modal "Exception happened" dialog
+
+# exception_info_t flags (ida_dbg / idd.hpp)
+_EXC_BREAK   = 0x0001   # break execution on exception
+_EXC_HANDLE  = 0x0002   # pass to debuggee's own handler (SEH chain)
+_EXC_MSG     = 0x0004   # display a message
+_EXC_SILENT  = 0x0008   # don't display anything
+
+
+def _pass_all_exceptions():
+    """Mark every known exception as 'pass to target's SEH handler, do
+    NOT break'. Required for iLok / VMProtect / similar protections
+    that raise structured exceptions as part of normal control flow —
+    without this, IDA traps every exception and execution loops at
+    the same PC forever.
+
+    IDA exposes get/set_exceptions via different names across versions;
+    we probe a couple. Returns count of types changed, or 0 if the API
+    surface wasn't found.
+    """
+    pairs = [
+        ("get_exceptions", "set_exceptions"),
+        ("dbg_get_exceptions", "dbg_set_exceptions"),
+    ]
+    for get_name, set_name in pairs:
+        getter = getattr(ida_dbg, get_name, None)
+        setter = getattr(ida_dbg, set_name, None)
+        if not (getter and setter):
+            continue
+        try:
+            excs = getter()
+            if excs is None:
+                continue
+            changed = 0
+            for exc in excs:
+                new_flags = (exc.flags & ~_EXC_BREAK) | _EXC_HANDLE | _EXC_SILENT
+                if new_flags != exc.flags:
+                    exc.flags = new_flags
+                    changed += 1
+            setter(excs)
+            _mcp_log(f"DBG pass-through enabled on {changed}/{len(excs)} exception types")
+            return changed
+        except Exception as e:
+            _mcp_log(f"DBG pass-through via {get_name} failed: {type(e).__name__}: {e}")
+    _mcp_log("DBG pass-through: get_exceptions/set_exceptions API not exposed")
+    return 0
+
+
+def _silence_debugger():
+    """One-stop 'make IDA stop wedging the main thread'. Disables the
+    modal exception dialog AND configures every known exception to be
+    passed through to the target's SEH chain. Called automatically from
+    dbg_attach / dbg_launch.
+    """
+    try:
+        opts = ida_dbg.get_debugger_options()
+        new_opts = (opts & ~_DOPT_EXCDLG_MASK) | _EXCDLG_NEVER
+        if new_opts != opts:
+            ida_dbg.set_debugger_options(new_opts)
+            _mcp_log(f"DBG silenced exception dialog (opts 0x{opts:x} -> 0x{new_opts:x})")
+    except Exception as e:
+        _mcp_log(f"DBG dialog silence failed: {type(e).__name__}: {e}")
+    _pass_all_exceptions()
+
+
+def dbg_silence():
+    """Manual trigger for _silence_debugger() — useful if attach was done
+    before the plugin loaded or via a different path."""
+    _silence_debugger()
+    return {"success": True}
+
+
 def dbg_attach(pid):
     """Attach to a running process by PID."""
     if _dbg_state_string() != "detached":
         return {"error": f"already attached (state={_dbg_state_string()})"}
+    _silence_debugger()
     _mcp_log(f"DBG ATTACH pid={pid}")
     ok = ida_dbg.attach_process(int(pid), -1)
     return {"success": int(ok) >= 0, "pid": int(pid), "state": _dbg_state_string()}
@@ -814,6 +897,7 @@ def dbg_launch(path, args=""):
     """Launch a new process under the debugger."""
     if _dbg_state_string() != "detached":
         return {"error": f"already attached (state={_dbg_state_string()})"}
+    _silence_debugger()
     _mcp_log(f"DBG LAUNCH path={path} args={args}")
     ok = ida_dbg.start_process(path, args, "")
     return {"success": int(ok) >= 0, "path": path, "state": _dbg_state_string()}
@@ -1160,30 +1244,6 @@ def _scratch_node():
     return ida_netnode.netnode(_SCRATCH_NETNODE_NAME, 0, True)
 
 
-def _mirror_to_ida_notepad(content):
-    """Best-effort mirror of scratch content into IDA's built-in Notepad.
-
-    Lets users view the scratch via View > Open subviews > Notepad without
-    needing to learn about our custom netnode. Tries the modern API path
-    first, falls back to direct RootNode blob write under tag 'I' (the
-    legacy storage path IDA uses for the Notepad). Silent on failure —
-    the scratch is still preserved in our own netnode either way.
-    """
-    try:
-        if hasattr(ida_nalt, "set_idb_notepad_text"):
-            ida_nalt.set_idb_notepad_text(content)
-            return True
-    except Exception:
-        pass
-    try:
-        rn = ida_netnode.netnode("Root Node")
-        rn.setblob(content.encode("utf-8"), 0, ord('I'))
-        return True
-    except Exception:
-        pass
-    return False
-
-
 def scratch_read():
     """Return current scratch content as markdown text."""
     try:
@@ -1203,18 +1263,16 @@ def scratch_read():
 def scratch_replace(content):
     """Replace the entire scratch buffer.
 
-    Also mirrors the content into IDA's built-in Notepad (best-effort) so
-    the user can read the scratch via View > Open subviews > Notepad.
+    If the in-IDA markdown viewer is open it will pick up the new content
+    on its next 200ms poll tick.
     """
     try:
         node = _scratch_node()
         text = content if isinstance(content, str) else content.decode("utf-8", "replace")
         data = text.encode("utf-8")
         node.setblob(data, 0, _SCRATCH_TAG)
-        mirrored = _mirror_to_ida_notepad(text)
-        _mcp_log(f"SCRATCH REPLACE: {len(data)} bytes "
-                 f"(notepad mirror: {'OK' if mirrored else 'FAILED'})")
-        return {"success": True, "size": len(data), "mirrored_to_notepad": mirrored}
+        _mcp_log(f"SCRATCH REPLACE: {len(data)} bytes")
+        return {"success": True, "size": len(data)}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -1244,6 +1302,331 @@ def scratch_log(category, content):
 def scratch_clear():
     """Empty the scratch buffer entirely."""
     return scratch_replace("")
+
+
+# ---------------------------------------------------------------------------
+# Markdown viewer (in-IDA dockable notebook)
+#
+# A PluginForm + QTextBrowser that renders the scratch netnode as HTML and
+# polls every 200ms — when the buffer grows (e.g. scratch_log fires from
+# an MCP call) the view re-renders and auto-scrolls to the new bottom.
+# Skips auto-scroll if the user has manually scrolled away from the bottom
+# (standard chat-UI pattern). Click on a sub_XXXXXX or 0x... → jumpto.
+#
+# Macro `{{decompile:0xADDR}}` expands at render time to the *current*
+# Hex-Rays output, so renamed locals propagate the next time scratch is
+# written (no copy/paste, no staleness).
+# ---------------------------------------------------------------------------
+
+_DARK_CSS = """
+body { background: #1e1e1e; color: #d4d4d4;
+       font-family: 'Segoe UI','Consolas',sans-serif; font-size: 13px;
+       padding: 6px 14px; }
+h1, h2, h3, h4 { color: #4ec9b0; margin-top: 1.0em; margin-bottom: 0.3em; }
+h1 { border-bottom: 1px solid #3c3c3c; padding-bottom: 4px; }
+h2 { border-bottom: 1px solid #2d2d2d; padding-bottom: 2px; }
+code { background: #2d2d2d; color: #ce9178; padding: 1px 4px;
+       border-radius: 3px; font-family: 'Consolas',monospace; }
+pre  { background: #252525; border-left: 3px solid #4ec9b0;
+       padding: 8px 12px; overflow-x: auto; font-family: 'Consolas',monospace; }
+pre code { background: transparent; padding: 0; color: #d4d4d4; }
+a { color: #569cd6; text-decoration: none; }
+a:hover { text-decoration: underline; color: #9cdcfe; }
+table { border-collapse: collapse; margin: 0.5em 0; }
+th, td { border: 1px solid #3c3c3c; padding: 4px 8px; }
+th { background: #2d2d2d; color: #4ec9b0; }
+hr { border: none; border-top: 1px solid #3c3c3c; margin: 1em 0; }
+blockquote { border-left: 3px solid #608b4e; margin: 0.5em 0;
+             padding: 4px 12px; color: #b5cea8; }
+"""
+
+
+_DECOMPILE_RE = re.compile(r"\{\{decompile:0x([0-9a-fA-F]+)\}\}")
+_ADDR_RE = re.compile(r"(?<![\w/])(0x[0-9a-fA-F]{3,}|sub_[0-9a-fA-F]+)(?!\w)")
+
+
+def _expand_md_macros(md):
+    """Expand {{decompile:0xADDR}} → fenced C code block with live pseudocode."""
+    def _replace_decompile(m):
+        try:
+            ea = int(m.group(1), 16)
+            result = decompile_function(ea)
+            if isinstance(result, dict) and "pseudocode" in result:
+                return "```c\n" + result["pseudocode"].rstrip() + "\n```"
+            err = result.get("error") if isinstance(result, dict) else str(result)
+            return f"`[decompile 0x{m.group(1)}: {err}]`"
+        except Exception as e:
+            return f"`[decompile 0x{m.group(1)}: {type(e).__name__}: {e}]`"
+    return _DECOMPILE_RE.sub(_replace_decompile, md)
+
+
+_MARKDOWN_PKG = None  # cached imported module after first successful load
+_MARKDOWN_INSTALL_STATE = "unknown"  # "unknown" | "installing" | "ok" | "failed"
+_MARKDOWN_INSTALL_LOCK = threading.Lock()
+
+
+def _ensure_markdown():
+    """Try to import `markdown`. If missing, fire-and-forget a background
+    pip install (the next render will pick it up). NEVER blocks the main
+    thread — the viewer's QTimer is on the main thread and a multi-second
+    pip subprocess would wedge IDA's UI + the HTTP request pump.
+
+    Returns the module if available, None otherwise. While installing,
+    returns None and the viewer renders an "installing..." placeholder.
+    """
+    global _MARKDOWN_PKG, _MARKDOWN_INSTALL_STATE
+    if _MARKDOWN_PKG is not None:
+        return _MARKDOWN_PKG
+    try:
+        import markdown as _md
+        _MARKDOWN_PKG = _md
+        _MARKDOWN_INSTALL_STATE = "ok"
+        return _md
+    except ImportError:
+        pass
+
+    with _MARKDOWN_INSTALL_LOCK:
+        if _MARKDOWN_INSTALL_STATE in ("installing", "failed"):
+            return None
+        _MARKDOWN_INSTALL_STATE = "installing"
+
+    def _worker():
+        global _MARKDOWN_PKG, _MARKDOWN_INSTALL_STATE
+        try:
+            import subprocess
+            import sys as _sys
+            ida_kernwin.msg("[MCP] Installing `markdown` package into IDA's Python (background)...\n")
+            subprocess.check_call(
+                [_sys.executable, "-m", "pip", "install", "--user", "--quiet", "markdown"],
+            )
+            import markdown as _md
+            _MARKDOWN_PKG = _md
+            _MARKDOWN_INSTALL_STATE = "ok"
+            ida_kernwin.msg("[MCP] `markdown` installed OK — viewer will pick it up on next render.\n")
+        except Exception as e:
+            _MARKDOWN_INSTALL_STATE = "failed"
+            ida_kernwin.msg(f"[MCP] markdown auto-install failed: {type(e).__name__}: {e}\n")
+
+    threading.Thread(target=_worker, name="mcp-markdown-install", daemon=True).start()
+    return None
+
+
+_MD_EXTENSIONS = ["extra", "nl2br", "sane_lists"]
+
+
+def _md_to_html(md):
+    """Render markdown → HTML using the `markdown` package. Auto-installs
+    the package on first miss; if that also fails, renders a styled
+    install-instructions page instead so the viewer is never blank.
+    """
+    expanded = _expand_md_macros(md)
+    pkg = _ensure_markdown()
+    if pkg is None:
+        if _MARKDOWN_INSTALL_STATE == "installing":
+            body = ("<h2 style='color:#dcdcaa;'>Installing markdown package…</h2>"
+                    "<p>Auto-install kicked off in a background thread. "
+                    "Viewer will re-render on next scratch write or "
+                    "<code>scratch_refresh</code> call.</p>")
+        else:
+            body = _missing_markdown_html()
+    else:
+        try:
+            body = pkg.markdown(expanded, extensions=_MD_EXTENSIONS)
+        except Exception as e:
+            body = ("<pre style='color:#f48771;'>markdown render error: "
+                    + html_escape(f"{type(e).__name__}: {e}") + "</pre>"
+                    "<pre>" + html_escape(expanded) + "</pre>")
+    body = _autolink_addresses(body)
+    return "<html><head><style>" + _DARK_CSS + "</style></head><body>" + body + "</body></html>"
+
+
+def _missing_markdown_html():
+    """Friendly install instructions shown in the viewer when the markdown
+    package isn't available and auto-install failed.
+    """
+    return (
+        "<h2 style='color:#f48771;'>Markdown renderer not available</h2>"
+        "<p>The notebook viewer needs the <code>markdown</code> pip package, "
+        "and the auto-install attempt failed (usually a permissions or network "
+        "issue inside IDA's bundled Python).</p>"
+        "<p>To install it manually, open IDA's Python console and run:</p>"
+        "<pre><code>import subprocess, sys\n"
+        "subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--user', 'markdown'])</code></pre>"
+        "<p>Then close + re-open the viewer (Ctrl+Shift+N).</p>"
+    )
+
+
+def _autolink_addresses(html):
+    """Wrap sub_XXXX and 0xXXXX literals in `<a href="ida://0x...">`. Skips
+    content inside existing `<a>...</a>` blocks so we don't double-link.
+    Address regex won't match inside HTML attribute values because the
+    quoted attributes are part of the <a> open tag, which we skip wholesale.
+    """
+    out = []
+    i = 0
+    n = len(html)
+    while i < n:
+        a_start = html.find("<a", i)
+        if a_start == -1:
+            out.append(_ADDR_RE.sub(_addr_link, html[i:]))
+            break
+        # Make sure it's the <a tag, not <abbr or <article
+        next_char = html[a_start + 2:a_start + 3]
+        if next_char not in (" ", ">", "\t", "\n"):
+            out.append(_ADDR_RE.sub(_addr_link, html[i:a_start + 1]))
+            i = a_start + 1
+            continue
+        out.append(_ADDR_RE.sub(_addr_link, html[i:a_start]))
+        a_end = html.find("</a>", a_start)
+        if a_end == -1:
+            out.append(html[a_start:])
+            break
+        a_end += 4  # past </a>
+        out.append(html[a_start:a_end])
+        i = a_end
+    return "".join(out)
+
+
+def _addr_link(m):
+    token = m.group(1)
+    addr_hex = token[4:] if token.startswith("sub_") else token[2:]
+    return '<a href="ida://0x{0}">{1}</a>'.format(addr_hex, token)
+
+
+_viewer = None  # singleton; one viewer per IDA process
+
+
+class _NotebookViewer(ida_kernwin.PluginForm):
+    """Dockable QTextBrowser-based markdown viewer for the scratch netnode.
+
+    Polls the netnode every POLL_MS — if the buffer's size changed we
+    re-render and auto-scroll. The QTimer lives inside the form, so
+    closing the form stops the timer.
+    """
+
+    POLL_MS = 200
+
+    def __init__(self):
+        super().__init__()
+        self._browser = None
+        self._timer = None
+        self._QtCore = None
+        self._last_size = -1
+        self._user_scrolled_away = False
+
+    def OnCreate(self, form):
+        # Lazy-import Qt: IDA 7/8 ships PyQt5; IDA 9 may have PySide2/6.
+        QtCore = QtWidgets = None
+        for mod in ("PyQt5", "PySide2", "PySide6"):
+            try:
+                pkg = __import__(mod, fromlist=["QtCore", "QtWidgets"])
+                QtCore = pkg.QtCore
+                QtWidgets = pkg.QtWidgets
+                break
+            except ImportError:
+                continue
+        if QtCore is None:
+            ida_kernwin.msg("[MCP] Notebook viewer: no Qt binding available\n")
+            return
+
+        self._QtCore = QtCore
+
+        widget = self.FormToPyQtWidget(form)
+        layout = QtWidgets.QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._browser = QtWidgets.QTextBrowser()
+        self._browser.setOpenLinks(False)
+        self._browser.setOpenExternalLinks(False)
+        self._browser.anchorClicked.connect(self._on_anchor)
+        sb = self._browser.verticalScrollBar()
+        sb.valueChanged.connect(self._on_scroll)
+        layout.addWidget(self._browser)
+        widget.setLayout(layout)
+
+        self._timer = QtCore.QTimer()
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(self.POLL_MS)
+
+        self._render_now()
+
+    def OnClose(self, form):
+        global _viewer
+        if self._timer is not None:
+            try:
+                self._timer.stop()
+            except Exception:
+                pass
+            self._timer = None
+        _viewer = None
+
+    def _on_scroll(self, _value):
+        sb = self._browser.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 4
+        self._user_scrolled_away = not at_bottom
+
+    def _tick(self):
+        try:
+            data = scratch_read()
+            size = data.get("size", 0)
+            if size != self._last_size:
+                self._render(data.get("content", ""))
+                self._last_size = size
+        except Exception as e:
+            ida_kernwin.msg(f"[MCP] viewer tick error: {type(e).__name__}: {e}\n")
+
+    def _render_now(self):
+        data = scratch_read()
+        self._render(data.get("content", ""))
+        self._last_size = data.get("size", 0)
+
+    def _render(self, md):
+        if self._browser is None:
+            return
+        was_at_bottom = not self._user_scrolled_away
+        html = _md_to_html(md or "_(notebook is empty — call `scratch_log` to add a section)_")
+        self._browser.setHtml(html)
+        if was_at_bottom:
+            sb = self._browser.verticalScrollBar()
+            sb.setValue(sb.maximum())
+            # setHtml resets scroll position; mark as still-at-bottom
+            self._user_scrolled_away = False
+
+    def _on_anchor(self, url):
+        s = url.toString() if hasattr(url, "toString") else str(url)
+        m = re.match(r"ida://(?:0x)?([0-9a-fA-F]+)", s)
+        if not m:
+            return
+        try:
+            ea = int(m.group(1), 16)
+            ida_kernwin.jumpto(ea)
+        except Exception as e:
+            ida_kernwin.msg(f"[MCP] jumpto failed: {e}\n")
+
+
+def scratch_show():
+    """Open (or re-show) the in-IDA markdown viewer."""
+    global _viewer
+    try:
+        if _viewer is None:
+            _viewer = _NotebookViewer()
+        _viewer.Show("MCP Notebook")
+        return {"success": True, "open": True}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def scratch_refresh():
+    """Force the viewer to re-render. Useful after IDB renames so the
+    embedded {{decompile:...}} blocks pick up new names without waiting
+    for the next scratch write.
+    """
+    if _viewer is None or _viewer._browser is None:
+        return {"success": False, "error": "Viewer not open — call scratch_show first"}
+    try:
+        _viewer._render_now()
+        return {"success": True, "refreshed": True}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 # ---------------------------------------------------------------------------
@@ -1302,7 +1685,9 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
 
         try:
-            result = _run_on_main_thread(self._dispatch, path, body)
+            result = _run_on_main_thread(
+                self._dispatch, path, body, _mcp_label=path,
+            )
             self._respond(result)
         except Exception as e:
             self._error(f"{type(e).__name__}: {e}", 500)
@@ -1317,11 +1702,51 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         "/scratch_replace", "/scratch_append", "/scratch_log", "/scratch_clear",
     })
 
+    # Endpoints whose body shouldn't be echoed in the audit log (too big,
+    # or the body IS the content we'd be summarizing).
+    _NOLOG_BODY = frozenset({
+        "/scratch_replace", "/scratch_append", "/scratch_log",
+        "/dbg_write_memory",
+    })
+
+    # Print "took Xs" only when a single request actually ran for longer
+    # than this. Anything below is normal IDA work.
+    _SLOW_REQUEST_SEC = 1.0
+
+    def _log_request(self, path, body):
+        """Echo every MCP hit into IDA's Output window so the user can
+        audit what we did. Mutations are flagged so they're easy to scan
+        for in the log.
+        """
+        if path in self._NOLOG_BODY:
+            arg_str = f"<{len(json.dumps(body or {}))} bytes>"
+        else:
+            try:
+                arg_str = json.dumps(body or {}, separators=(",", ":"))
+                if len(arg_str) > 200:
+                    arg_str = arg_str[:197] + "..."
+            except Exception:
+                arg_str = repr(body)[:200]
+        tag = "MUT" if path in self._MUTATING else "   "
+        ida_kernwin.msg(f"[MCP {tag}] {path} {arg_str}\n")
+
     def _dispatch(self, path, body):
+        self._log_request(path, body)
+
         if path in self._MUTATING:
             blocked = _refuse_if_debugging(path)
             if blocked is not None:
                 return blocked
+
+        t0 = time.monotonic()
+        try:
+            return self._dispatch_inner(path, body)
+        finally:
+            dt = time.monotonic() - t0
+            if dt > self._SLOW_REQUEST_SEC:
+                ida_kernwin.msg(f"[MCP SLOW] {path} took {dt:.2f}s\n")
+
+    def _dispatch_inner(self, path, body):
 
         if path == "/function":
             addr_str = body.get("address")
@@ -1526,6 +1951,9 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/dbg_detach":
             return dbg_detach()
 
+        elif path == "/dbg_silence":
+            return dbg_silence()
+
         elif path == "/dbg_terminate":
             return dbg_terminate()
 
@@ -1651,6 +2079,12 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/scratch_clear":
             return scratch_clear()
 
+        elif path == "/scratch_show":
+            return scratch_show()
+
+        elif path == "/scratch_refresh":
+            return scratch_refresh()
+
         else:
             return {"error": f"Unknown endpoint: {path}"}
 
@@ -1694,6 +2128,36 @@ _thread = None
 _reg_path = None
 
 
+_OPEN_NOTEBOOK_ACTION = "mcp:open_notebook"
+
+
+class _OpenNotebookHandler(ida_kernwin.action_handler_t):
+    """Ctrl+Shift+N → open the MCP markdown notebook viewer."""
+
+    def activate(self, ctx):
+        scratch_show()
+        return 1
+
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
+
+def _register_notebook_action():
+    """Idempotent: register the Ctrl+Shift+N hotkey. IDA returns False if
+    the action is already registered; that's fine."""
+    try:
+        desc = ida_kernwin.action_desc_t(
+            _OPEN_NOTEBOOK_ACTION,
+            "Open MCP Notebook",
+            _OpenNotebookHandler(),
+            "Ctrl+Shift+N",
+            "Open the per-IDB MCP markdown notebook",
+        )
+        ida_kernwin.register_action(desc)
+    except Exception as e:
+        print(f"[MCP] Could not register notebook action: {e}")
+
+
 def start_server():
     """Start the HTTP server and main-thread timer."""
     global _server, _thread, _reg_path, _ui_timer
@@ -1711,9 +2175,12 @@ def start_server():
     _thread.start()
     _reg_path = _register(port)
 
+    _register_notebook_action()
+
     print(f"[MCP] Server started on http://127.0.0.1:{port}")
     print(f"[MCP] IDB: {_idb_name()}")
     print(f"[MCP] Registration: {_reg_path}")
+    print(f"[MCP] Notebook viewer hotkey: Ctrl+Shift+N")
 
 
 def stop_server():

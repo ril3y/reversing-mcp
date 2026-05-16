@@ -24,9 +24,15 @@ NAME_KEYS = ("idb", "idb_path")
 mcp = FastMCP("ida")
 
 
-def _call(endpoint, body=None, idb=None):
+def _call(endpoint, body=None, idb=None, timeout=10):
+    """HTTP call into the IDA bridge.
+
+    Default timeout 10s — short enough to surface plugin failures fast
+    instead of hanging. Endpoints that legitimately wait longer (today
+    only dbg_wait_event) must pass an explicit ``timeout``.
+    """
     return call_instance(REG_DIR, endpoint, body, target=idb,
-                         tool_name=TOOL, name_keys=NAME_KEYS, timeout=30)
+                         tool_name=TOOL, name_keys=NAME_KEYS, timeout=timeout)
 
 
 @mcp.tool()
@@ -393,6 +399,25 @@ def dbg_detach(idb: str = "") -> dict:
 
 
 @mcp.tool()
+def dbg_silence(idb: str = "") -> dict:
+    """Silence IDA debugger popups + mark all exceptions as pass-through.
+
+    Done automatically on dbg_attach / dbg_launch. Use this manually if
+    the process is already being debugged (started from IDA's UI rather
+    than via this MCP) and the user is fighting popups + exception loops.
+
+    Specifically:
+    - DOPT_EXCDLG -> EXCDLG_NEVER (no modal exception dialog)
+    - every known exception's flags: clear EXC_BREAK, set EXC_HANDLE + EXC_SILENT
+      (target's SEH handler gets the exception, IDA does not pause)
+
+    Without this, iLok/VMProtect-style protections trap IDA in an
+    exception loop at the first protected code region.
+    """
+    return _call("/dbg_silence", {}, idb=idb or None)
+
+
+@mcp.tool()
 def dbg_terminate(idb: str = "") -> dict:
     """Kill the debuggee."""
     return _call("/dbg_terminate", {}, idb=idb or None)
@@ -535,8 +560,10 @@ def dbg_wait_event(timeout_s: int = 30, idb: str = "") -> dict:
     """Block until the next debug event (BP hit, exception, exit, ...).
 
     Returns ``{event_code, state, pc}``. Useful for 'continue, then wait'.
+    HTTP timeout = ``timeout_s`` + 5s slack so we don't cut the wait short.
     """
-    return _call("/dbg_wait_event", {"timeout_s": timeout_s}, idb=idb or None)
+    return _call("/dbg_wait_event", {"timeout_s": timeout_s},
+                 idb=idb or None, timeout=timeout_s + 5)
 
 
 @mcp.tool()
@@ -653,6 +680,31 @@ def scratch_replace(content: str, idb: str = "") -> dict:
 def scratch_clear(idb: str = "") -> dict:
     """Empty the scratch buffer entirely. Irreversible."""
     return _call("/scratch_clear", {}, idb=idb or None)
+
+
+@mcp.tool()
+def scratch_show(idb: str = "") -> dict:
+    """Open the in-IDA markdown notebook viewer.
+
+    Renders the scratch netnode as live markdown inside a dockable
+    QTextBrowser. Auto-refreshes on scratch writes (200ms poll). Click
+    on a `sub_XXXXXX` or `0x...` link to jumpto. Embed live pseudocode
+    in markdown source with `{{decompile:0xADDR}}` — re-expands at
+    every render so renames propagate.
+
+    Hotkey inside IDA: Ctrl+Shift+N also opens the viewer.
+    """
+    return _call("/scratch_show", {}, idb=idb or None)
+
+
+@mcp.tool()
+def scratch_refresh(idb: str = "") -> dict:
+    """Force the notebook viewer to re-render now.
+
+    Useful after applying renames so the embedded `{{decompile:...}}`
+    blocks pick up new names without waiting for the next scratch write.
+    """
+    return _call("/scratch_refresh", {}, idb=idb or None)
 
 
 if __name__ == "__main__":

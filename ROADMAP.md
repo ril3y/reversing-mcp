@@ -7,80 +7,37 @@ self-contained chunk of work — pick whatever's highest leverage.
 Effort estimates assume working in-tree with the existing patterns:
 **S** = under 100 LOC, ~1 hour · **M** = 100–500 LOC, ~half a day · **L** = full feature, ~1+ days.
 
-## ★ Next-up top priority: Interactive markdown notebook (in-IDA GUI)
+## ✅ Shipped: Interactive markdown notebook (in-IDA GUI)
 
-A dockable IDA Pro view that renders the per-IDB scratch notebook as live
-markdown with bidirectional links to the IDB. Auto-updates as you make
-discoveries; embedded code blocks pick up renames automatically.
+Landed as `_NotebookViewer` (PluginForm + QTextBrowser) inside
+`ida/plugin.py`. New endpoints: `scratch_show`, `scratch_refresh`.
+Hotkey `Ctrl+Shift+N` opens the viewer; auto-refresh polls the scratch
+netnode every 200 ms and re-renders + auto-scrolls when the buffer
+grows (skips auto-scroll if the user manually scrolled away — standard
+chat-UI pattern). Click on `sub_XXXXXX` or `0x...` jumps the disassembly
+view. `{{decompile:0xADDR}}` macro in markdown source expands to live
+Hex-Rays pseudocode at render time, so renames propagate the next time
+the notebook re-renders.
 
-### Streaming-style rendering (UX requirement, NOT decoration)
+Renderer: prefers the Python `markdown` package; ships a hand-rolled
+fallback that handles headers, fenced code, inline code, bold/italic,
+lists, paragraphs, and links so a fresh IDA-Python install still works.
 
-The viewer must render new content **as it arrives**, not all-at-once. The
-"bam, here's 3000 chars of markdown, now scroll for days" experience is
-exactly what we're avoiding. Agents should be able to stream their thinking
-into the notebook the same way Claude's own output streams — section header,
-then a sentence, then another sentence, then a code block, scrolling along
-with the new content as it lands.
+### Still-open follow-ups
 
-Implementation: this isn't a server-side push; it's just **bridge polling +
-agent chunking**.
-
-- Bridge side: scratch_append (already shipped) lets the agent send arbitrary
-  small chunks. No new endpoint needed for the MVP — but a thin convenience
-  wrapper `scratch_stream(category, [chunk1, chunk2, ...])` that fires the
-  chunks with brief delays makes the agent's intent explicit and the UX
-  smoother.
-- Viewer side: poll the scratch netnode every ~100 ms; if `size` increased,
-  re-render the tail and auto-scroll to the new bottom. (Re-render the
-  *whole* notebook is fine too — typical notebook ~10 KB, rendering is
-  cheap.) Skip auto-scroll if the user has manually scrolled away from
-  the bottom — standard chat-UI pattern.
-
-### What makes it more than a viewer
-
-- **Live inline code** — markdown source like `{{decompile:0x1814C4AA0}}`
-  expands to the *current* Hex-Rays output at render time. Rename a local
-  variable in IDA → the embedded code block in the notebook re-renders to
-  show the new name. No copy/paste, no staleness.
-- **Clickable anchors** — auto-link `sub_XXXXXX` and `0x...` to `ida://...`
-  URLs; click dispatches to `ida_kernwin.jumpto(addr)`.
-- **Auto-refresh on IDB changes** — subscribed to `IDB_Hooks` (rename,
-  cmt_changed, func_added, func_deleted). Anything you do in the IDA UI
-  is reflected in the notebook within a render tick.
-- **Streaming append** — when MCP `scratch_log` writes a new section, the
-  view scrolls to it.
-
-### Layers
-
-| Layer | Mechanism |
-|---|---|
-| GUI form | `ida_kernwin.PluginForm` subclass + Qt `QTextBrowser` (HTML render, anchor clicks). Hotkey `Ctrl+Shift+N` to open. |
-| Markdown render | Python `markdown` + custom extensions for `{{decompile:...}}`, `{{disasm:...,n}}`, `{{xrefs:...}}`. Auto-link addresses + sub_XXXXXX. |
-| Click dispatch | `QTextBrowser.anchorClicked` → parse `ida://...` → `jumpto(ea)` / open Hex-Rays / trigger named action. |
-| Auto-refresh | `ida_idp.IDB_Hooks` subclass + `execute_sync` re-render scheduler. Also wired into `scratch_replace`. |
-
-### Endpoints to add
-
-- `scratch_show()` — open the viewer.
-- `scratch_refresh()` — force re-render.
-- `scratch_stream(category, chunks: list[str])` — convenience wrapper for
-  streamed sections; fires `scratch_section_start` + N `scratch_append`
-  with small delays so the viewer renders it incrementally rather than
-  all-at-once. Optional — `scratch_append` chained from the agent works
-  equally well; this is just ergonomic sugar.
-
-### What to steal
-
-- IDA SDK `ex_pluginform.py` for form scaffolding.
-- `lighthouse` (the IDA coverage plugin, MIT-licensed) for the
-  `PluginForm + Qt widget + IDB_Hooks` pattern — the cleanest open-source
-  example.
-- Python `markdown` + `mdx_gfm` extension for tables/strikethrough.
-
-### Effort
-
-**L** (~500–800 LOC over two focused sessions). Worth doing right rather
-than rushing.
+- **`IDB_Hooks` auto-refresh.** Today the viewer refreshes when the
+  scratch netnode grows. Wiring `ida_idp.IDB_Hooks` (rename_done,
+  cmt_changed, func_added/deleted) into `_render_now()` would make the
+  embedded `{{decompile:...}}` blocks re-render the *moment* you commit
+  a rename in IDA — no scratch write needed.
+- **`scratch_stream(category, chunks)`** convenience endpoint. Makes
+  agent intent explicit ("I'm streaming these sections in order") and
+  inserts tiny delays so the viewer renders each chunk before the next
+  arrives. Today an agent calling `scratch_append` in a loop works
+  fine — this is sugar.
+- **More macros.** `{{disasm:0xADDR,N}}` (N lines of disassembly),
+  `{{xrefs:0xADDR}}` (caller table). Same expansion pattern as the
+  decompile macro.
 
 ## ✅ Shipped this session: IDA debugger integration
 
@@ -290,6 +247,23 @@ Effort: **S** once the unified server is in place.
 
 ## Recently shipped (just so future-you knows what's done)
 
+- **Bridge ergonomics under debug**: `dbg_silence` endpoint (auto-runs on
+  attach/launch) that disables `DOPT_EXCDLG` AND marks every known
+  exception as pass-through (`EXC_HANDLE` + `EXC_SILENT`, clears
+  `EXC_BREAK`). Required for iLok/VMProtect-style protections that throw
+  exceptions as normal control flow. Without it, IDA traps the first one
+  and the debuggee can never make progress.
+- **Per-request audit logging**: every MCP hit logs `[MCP MUT|   ] /path body`
+  to IDA's Output window. Slow requests (>1s) log `[MCP SLOW] /path took Xs`.
+  Stalled-queue warnings name the path: `[MCP] WARNING: '/decompile' queued for >5s`.
+- **Markdown viewer**: pip-installs `markdown` package on a background thread
+  (no more main-thread stall), shows install-instructions page only if that fails.
+- **MCP HTTP timeout** lowered to 10s default (was 30s); `dbg_wait_event` uses
+  `timeout_s + 5` so legitimate waits aren't cut short.
+- **In-IDA markdown notebook viewer.** `_NotebookViewer` PluginForm +
+  `scratch_show` / `scratch_refresh` endpoints + `Ctrl+Shift+N` action.
+  `{{decompile:0xADDR}}` live macro. Replaced the (never-worked)
+  Notepad mirror.
 - `define_type`, `apply_type`, `set_function_prototype`, `add_segment`, `set_segment_attrs` on the IDA bridge. (`cb84048` ish)
 - Modal-dialog watchdog + `idc.batch(1)` per-handler wrapping in `_MainThreadTimer._tick`.
 - Windows-safe PID liveness check in `common.py` (do not regress this — it killed a live IDA during dev).
