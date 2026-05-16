@@ -135,6 +135,34 @@ python unicorn/bridge.py --arch thumb
 
 `tests/` is a pytest suite. The `FakeBridge` fixture in `tests/conftest.py` stands up a loopback `HTTPServer` and writes a registration file pointing at it, so MCP servers can be exercised end-to-end without spinning up any real RE tool. `test_common.py` covers discovery (live/dead PID, corrupt JSON, substring resolve across multiple name keys) and the proxy (HTTP body, ConnectError → registration cleanup). The per-server tests (`test_jadx_server.py`, `test_ilspy_server.py`, `test_unicorn_server.py`) verify each MCP tool builds the right request body — they load each `mcp_server.py` by explicit file path (all share the bare module name `mcp_server` so sys.path imports collide).
 
+## Workflow guidance — read this before driving the IDA bridge
+
+### Bank discoveries to the IDB as you find them
+
+The point of the rename / add_comment / define_type / apply_type / set_function_prototype / rename_local_var / set_local_var_type endpoints is that **annotations compound**: every re-decompile after a rename shows the renamed identifier in the pseudocode, every re-decompile after `set_function_prototype` shows the named parameters, every type applied to a struct field gets `self->named_field` in place of `*((_QWORD *)self + 5)`. **A 5-minute investment up front saves dozens of squints on later questions about the same code.**
+
+If during analysis you discover **any** of these, persist it *before* moving on:
+
+| Discovery | Endpoint |
+|---|---|
+| Function name from assertion / RTTI / vtable / xref pattern | `rename` |
+| Calling convention or parameter purposes | `set_function_prototype` |
+| Struct / class layout (even partial — pad the unknowns) | `define_type` + `apply_type` |
+| State change / non-obvious behavior / DRM observation at an address | `add_comment` (use `repeatable=true` so the comment shows at all xrefs) |
+| Hex-Rays local-variable purpose | `rename_local_var` (+ `set_local_var_type` if you also know the type) |
+| Whole memory region's meaning (e.g. MMIO range, runtime-allocated VM area) | `add_segment` + `set_segment_attrs` |
+
+### Debugger safety — mutations are blocked while attached
+
+Mutating the IDA type library / function index / segment table **while the debugger is paused at a breakpoint** can crash IDA. Observed 2026-05-16 during a Saleae live-test — `ida64.exe` died mid-session, lost several captured payloads. The plugin guards against this: any `_MUTATING` endpoint called while `dbg_state() in ("paused", "running")` returns a refusal error. Workflow:
+
+1. Capture register state + memory bytes *while paused* (those endpoints are safe).
+2. `dbg_detach()`.
+3. Apply renames / comments / types.
+4. Re-attach if you still need to keep debugging.
+
+Don't try to skip step 2. The guard refuses for a reason.
+
 ## WIP branches
 
 The `unicorn/`, `saleae_native/`, `cookbooks/`, and `tests/test_unicorn_server.py` paths

@@ -22,6 +22,7 @@ import ida_funcs
 import ida_hexrays
 import ida_ida
 import ida_idaapi
+import ida_idd
 import ida_kernwin
 import ida_lines
 import ida_name
@@ -755,6 +756,26 @@ def _require_paused():
     return {"error": f"debuggee is {s}; call dbg_pause first"}
 
 
+def _refuse_if_debugging(endpoint_name):
+    """Block mutating IDB ops while a debugger is attached.
+
+    Mutating IDA's type library / function index / segment table while the
+    debugger is paused at a BP can crash IDA — observed 2026-05-16 during
+    a Saleae live-test (ida64.exe died, lost ~3 captured payloads). The
+    main thread is in wait_for_next_event AND our timer is trying to
+    drain mutation handlers AND those handlers want to re-enter Hex-Rays/
+    typeinf machinery. Refuse cleanly instead.
+
+    Detach first (dbg_detach), apply the annotations, then re-attach if
+    you still need to continue debugging.
+    """
+    if _dbg_state_string() in ("paused", "running"):
+        return {"error": f"{endpoint_name} blocked: debugger is "
+                         f"{_dbg_state_string()}. Call dbg_detach first, "
+                         f"apply the change, then re-attach if needed."}
+    return None
+
+
 def _auto_suspend_and_run(fn):
     """Auto-suspend the debuggee if running, call fn, resume if we suspended.
 
@@ -1016,17 +1037,30 @@ def dbg_wait_event(timeout_s=30):
 # ---- callstack / threads / modules ----
 
 def dbg_callstack():
-    """Return the current thread's call stack frames."""
+    """Return the current thread's call stack frames.
+
+    Uses ida_dbg.collect_stacktrace which fills an ida_idd.call_stack_t
+    container. Frames have .pc (instruction pointer) and .fp (frame pointer).
+    """
     def _do():
         frames = []
         try:
             tid = idc.get_current_thread()
-            cs = idc.get_callstack(tid) if hasattr(idc, "get_callstack") else None
-            if cs:
-                for f in cs:
-                    frames.append({"pc": f"0x{f.pc:X}", "fp": f"0x{f.fp:X}"})
+            trace = ida_idd.call_stack_t()
+            ok = ida_dbg.collect_stacktrace(trace, tid)
+            if not ok:
+                return {"frames": [], "note": "collect_stacktrace returned False"}
+            for i in range(trace.size()):
+                frame = trace.at(i)
+                frames.append({
+                    "depth": i,
+                    "pc": f"0x{frame.pc:X}",
+                    "fp": f"0x{frame.fp:X}" if hasattr(frame, "fp") else "0",
+                    "name": ida_name.get_name(frame.pc) or "",
+                })
         except Exception as e:
-            return {"error": f"{type(e).__name__}: {e}"}
+            return {"error": f"{type(e).__name__}: {e}",
+                    "frames": frames}  # whatever we collected before the error
         return {"frames": frames}
     return _auto_suspend_and_run(_do)
 
@@ -1044,18 +1078,25 @@ def dbg_threads():
 
 
 def dbg_modules():
-    """List loaded modules of the debuggee (base, size, name)."""
+    """List loaded modules of the debuggee (base, size, name).
+
+    modinfo_t lives in ida_idd, not ida_dbg. get_first_module/get_next_module
+    are on ida_dbg though.
+    """
     def _do():
         out = []
-        mod = ida_dbg.modinfo_t()
-        ok = ida_dbg.get_first_module(mod)
-        while ok:
-            out.append({
-                "name": mod.name,
-                "base": f"0x{mod.base:X}",
-                "size": mod.size,
-            })
-            ok = ida_dbg.get_next_module(mod)
+        try:
+            mod = ida_idd.modinfo_t()
+            ok = ida_dbg.get_first_module(mod)
+            while ok:
+                out.append({
+                    "name": mod.name,
+                    "base": f"0x{mod.base:X}",
+                    "size": mod.size,
+                })
+                ok = ida_dbg.get_next_module(mod)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}", "modules": out}
         return {"modules": out}
     return _auto_suspend_and_run(_do)
 
@@ -1160,7 +1201,21 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             self._error(f"{type(e).__name__}: {e}", 500)
 
+    # Endpoints that mutate the IDB. Guarded against running while
+    # the debugger is engaged — those re-entries can crash IDA.
+    _MUTATING = frozenset({
+        "/rename", "/comment", "/create_function", "/delete_function",
+        "/make_code", "/define_type", "/apply_type",
+        "/set_function_prototype", "/add_segment", "/set_segment_attrs",
+        "/rename_local_var", "/set_local_var_type",
+    })
+
     def _dispatch(self, path, body):
+        if path in self._MUTATING:
+            blocked = _refuse_if_debugging(path)
+            if blocked is not None:
+                return blocked
+
         if path == "/function":
             addr_str = body.get("address")
             name = body.get("name")
