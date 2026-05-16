@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>IlspyMcp</RootNamespace>
+    <AssemblyName>ilspy-mcp-bridge</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- ICSharpCode.Decompiler is the engine ILSpy ships on top of. -->
+    <PackageReference Include="ICSharpCode.Decompiler" Version="9.0.0.7889" />
+  </ItemGroup>
+
+</Project>

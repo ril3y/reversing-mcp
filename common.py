@@ -9,8 +9,38 @@ calling those instances over HTTP.
 
 import json
 import os
+import sys
 
 import httpx
+
+
+def _pid_alive(pid: int) -> bool:
+    """Cross-platform PID liveness check that does NOT signal the process.
+
+    On Windows we MUST NOT use ``os.kill(pid, 0)`` — depending on the Python
+    build it routes through ``TerminateProcess`` and actually kills the target
+    (CPython issue tracker has multiple reports, and this bug killed a running
+    IDA Pro instance during development of this repo). Use ``OpenProcess`` with
+    ``PROCESS_QUERY_LIMITED_INFORMATION`` — a strictly read-only right — then
+    immediately close the handle.
+    """
+    if pid is None or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
+    else:
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
 
 
 def discover_instances(reg_dir: str) -> list[dict]:
@@ -27,12 +57,9 @@ def discover_instances(reg_dir: str) -> list[dict]:
             with open(path) as f:
                 info = json.load(f)
             pid = info.get("pid")
-            if pid:
-                try:
-                    os.kill(pid, 0)
-                except OSError:
-                    os.unlink(path)
-                    continue
+            if pid and not _pid_alive(pid):
+                os.unlink(path)
+                continue
             instances.append(info)
         except (json.JSONDecodeError, IOError):
             continue

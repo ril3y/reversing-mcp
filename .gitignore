@@ -12,6 +12,13 @@ build/
 *.class
 *.jar
 
+# .NET build artifacts
+bin/
+obj/
+*.dll
+*.pdb
+*.exe
+
 # Ghidra extension build artifacts
 ghidra/ghidra-mcp-bridge/.gradle/
 ghidra/ghidra-mcp-bridge/build/

@@ -1,0 +1,62 @@
+// jadx MCP bridge — standalone Java app that loads an APK/JAR via jadx-core
+// and exposes a JSON-over-HTTP API the Python MCP server proxies.
+//
+//   ./gradlew shadowJar
+//   java -jar build/libs/jadx-mcp-bridge.jar path/to/app.apk
+//
+// Requires JDK 17+. jadx-core is pulled from Maven Central.
+
+plugins {
+    id 'application'
+    id 'com.gradleup.shadow' version '8.3.5'
+}
+
+repositories {
+    mavenCentral()
+    // jadx-core depends on Android tooling (aapt2-proto, smali) which only
+    // lives in Google's Maven repo, not Maven Central.
+    google()
+}
+
+dependencies {
+    implementation 'io.github.skylot:jadx-core:1.5.0'
+    implementation 'io.github.skylot:jadx-dex-input:1.5.0'
+    implementation 'io.github.skylot:jadx-java-input:1.5.0'
+    implementation 'io.github.skylot:jadx-smali-input:1.5.0'
+
+    // slf4j to silence jadx-core's logger
+    implementation 'org.slf4j:slf4j-simple:2.0.13'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    // Gradle 9 requires the platform launcher on the test runtime classpath.
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.2'
+}
+
+application {
+    mainClass = 'jadxmcp.JadxMcpBridge'
+}
+
+// Target class-file v17 regardless of which JDK is on JAVA_HOME (JDK 17 or 21).
+// We intentionally skip the java { toolchain { ... } } block because Gradle's
+// auto-detection misses some Windows JDK install paths (e.g. OpenLogic), and
+// `--release 17` is sufficient for binary compatibility.
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 17
+}
+
+shadowJar {
+    archiveBaseName = 'jadx-mcp-bridge'
+    archiveClassifier = ''
+    archiveVersion = ''
+    mergeServiceFiles()
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+// Build the fat jar by default
+tasks.named('build') {
+    dependsOn 'shadowJar'
+}
