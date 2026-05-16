@@ -1160,6 +1160,30 @@ def _scratch_node():
     return ida_netnode.netnode(_SCRATCH_NETNODE_NAME, 0, True)
 
 
+def _mirror_to_ida_notepad(content):
+    """Best-effort mirror of scratch content into IDA's built-in Notepad.
+
+    Lets users view the scratch via View > Open subviews > Notepad without
+    needing to learn about our custom netnode. Tries the modern API path
+    first, falls back to direct RootNode blob write under tag 'I' (the
+    legacy storage path IDA uses for the Notepad). Silent on failure —
+    the scratch is still preserved in our own netnode either way.
+    """
+    try:
+        if hasattr(ida_nalt, "set_idb_notepad_text"):
+            ida_nalt.set_idb_notepad_text(content)
+            return True
+    except Exception:
+        pass
+    try:
+        rn = ida_netnode.netnode("Root Node")
+        rn.setblob(content.encode("utf-8"), 0, ord('I'))
+        return True
+    except Exception:
+        pass
+    return False
+
+
 def scratch_read():
     """Return current scratch content as markdown text."""
     try:
@@ -1177,13 +1201,20 @@ def scratch_read():
 
 
 def scratch_replace(content):
-    """Replace the entire scratch buffer."""
+    """Replace the entire scratch buffer.
+
+    Also mirrors the content into IDA's built-in Notepad (best-effort) so
+    the user can read the scratch via View > Open subviews > Notepad.
+    """
     try:
         node = _scratch_node()
-        data = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        text = content if isinstance(content, str) else content.decode("utf-8", "replace")
+        data = text.encode("utf-8")
         node.setblob(data, 0, _SCRATCH_TAG)
-        _mcp_log(f"SCRATCH REPLACE: {len(data)} bytes")
-        return {"success": True, "size": len(data)}
+        mirrored = _mirror_to_ida_notepad(text)
+        _mcp_log(f"SCRATCH REPLACE: {len(data)} bytes "
+                 f"(notepad mirror: {'OK' if mirrored else 'FAILED'})")
+        return {"success": True, "size": len(data), "mirrored_to_notepad": mirrored}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
