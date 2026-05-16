@@ -29,6 +29,7 @@ sys.modules["ida_kernwin"].msg = lambda *a, **k: None
 sys.modules["ida_idaapi"].plugin_t = type("plugin_t", (object,), {})
 sys.modules["ida_idaapi"].PLUGIN_KEEP = 0
 sys.modules["ida_idaapi"].BADADDR = -1
+sys.modules["ida_dbg"].DBG_Hooks = type("DBG_Hooks", (object,), {"hook": lambda self: None})
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ida"))
 import plugin  # noqa: E402

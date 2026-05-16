@@ -1062,9 +1062,160 @@ def dbg_set_breakpoint(addr, bp_type="sw", size=1):
 
 def dbg_del_breakpoint(addr):
     """Remove the breakpoint at addr."""
+    # If this is a trace BP, also remove it from the trace dict
+    _TRACE_BPS.pop(addr, None)
     ok = ida_dbg.del_bpt(addr)
     _mcp_log(f"DBG BP- 0x{addr:X}: {'OK' if ok else 'FAILED'}")
     return {"success": bool(ok), "address": f"0x{addr:X}"}
+
+
+# ---------------------------------------------------------------------------
+# Non-pausing trace BPs (anti-watchdog)
+#
+# Protected USB devices like iLok-wrapped Logic 2 install a watchdog that
+# detects long inter-packet gaps caused by the debugger pausing. Standard
+# BPs pause the process for hundreds of ms during the MCP roundtrip
+# (get_regs → read_memory → continue), which trips the watchdog and the
+# device returns "devicesetupfailure".
+#
+# Trace BPs solve this: install a DBG_Hooks subscriber whose dbg_bpt()
+# returns BPTEVAL_NOSTOP (1) — IDA processes the event but does NOT pause
+# the process. Inside the hook we read registers + the memory pointed to
+# by configured addr/size registers, append to an in-process log buffer,
+# and the process resumes within microseconds.
+#
+# Workflow:
+#   dbg_set_trace_bp(0x1814C4BBB, label="WinUsbWrite",
+#                    addr_reg="r8", size_reg="r9")
+#   # ... run capture (BP fires N times silently, log fills) ...
+#   dbg_get_trace_log()  # pull all dumps in one call
+# ---------------------------------------------------------------------------
+
+_TRACE_BPS = {}   # ea -> {label, addr_reg, size_reg}
+_TRACE_LOG = []   # list of dump records
+_TRACE_HOOK = None
+_TRACE_REGS = ("rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+               "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip")
+
+
+def _trace_capture(cfg, bptea, tid):
+    """Read regs + memory on a trace BP hit. Runs in IDA's debugger
+    callback context — must be fast and must not raise.
+    """
+    record = {
+        "ts": time.time(),
+        "label": cfg.get("label", ""),
+        "ea": f"0x{bptea:X}",
+        "tid": tid,
+    }
+    try:
+        regs = {}
+        for r in _TRACE_REGS:
+            try:
+                regs[r] = f"0x{idc.get_reg_value(r):X}"
+            except Exception:
+                pass
+        record["regs"] = regs
+
+        addr_reg = cfg.get("addr_reg")
+        size_reg = cfg.get("size_reg")
+        if addr_reg and size_reg:
+            try:
+                addr = idc.get_reg_value(addr_reg)
+                size = idc.get_reg_value(size_reg)
+                record["addr"] = f"0x{addr:X}"
+                record["size"] = int(size)
+                # Clamp size to prevent runaway reads if a register holds
+                # a bogus value.
+                if 0 < size < 65536:
+                    data = idc.read_dbg_memory(addr, int(size))
+                    if data:
+                        record["data"] = data.hex()
+            except Exception as e:
+                record["mem_error"] = f"{type(e).__name__}: {e}"
+    except Exception as e:
+        record["error"] = f"{type(e).__name__}: {e}"
+    return record
+
+
+class _TraceBptHook(ida_dbg.DBG_Hooks):
+    """DBG_Hooks subclass that silently captures trace-BP hits without
+    pausing the debuggee. Returns BPTEVAL_NOSTOP (1) for registered
+    trace BPs so IDA continues immediately.
+    """
+
+    def dbg_bpt(self, tid, bptea):
+        cfg = _TRACE_BPS.get(bptea)
+        if cfg is None:
+            return 0  # normal pause behavior for non-trace BPs
+        try:
+            _TRACE_LOG.append(_trace_capture(cfg, bptea, tid))
+        except Exception as e:
+            _TRACE_LOG.append({"label": cfg.get("label", ""),
+                               "ea": f"0x{bptea:X}",
+                               "error": f"hook: {type(e).__name__}: {e}"})
+        return 1  # BPTEVAL_NOSTOP — IDA does not pause
+
+
+def _ensure_trace_hook():
+    """Install the DBG_Hooks subscriber on first trace-BP registration."""
+    global _TRACE_HOOK
+    if _TRACE_HOOK is None:
+        _TRACE_HOOK = _TraceBptHook()
+        _TRACE_HOOK.hook()
+        _mcp_log("DBG trace-BP hook installed")
+
+
+def dbg_set_trace_bp(addr, label="", addr_reg="r8", size_reg="r9"):
+    """Arm a non-pausing trace BP. On hit, dumps registers + memory
+    pointed to by addr_reg/size_reg, appends to the trace log, and
+    auto-continues.
+
+    Args:
+        addr: address to break on
+        label: free-form tag stored with each dump record
+        addr_reg: register holding the data pointer (default r8 = arg3
+                  in Win64 fastcall — matches WinUsb_WritePipe's buf)
+        size_reg: register holding the data size (default r9 = arg4)
+    """
+    _ensure_trace_hook()
+    ok = ida_dbg.add_bpt(int(addr))
+    # If add_bpt returns False the BP may already exist; treat as success
+    # since the user's intent is "I want this address to be a trace BP".
+    _TRACE_BPS[int(addr)] = {"label": label,
+                              "addr_reg": addr_reg,
+                              "size_reg": size_reg}
+    _mcp_log(f"TRACE BP+ 0x{int(addr):X} label='{label}' "
+             f"addr_reg={addr_reg} size_reg={size_reg}")
+    return {"success": True, "address": f"0x{int(addr):X}",
+            "label": label, "bp_added": bool(ok),
+            "note": "non-pausing — call dbg_get_trace_log to retrieve hits"}
+
+
+def dbg_clear_trace_bp(addr):
+    """Unregister a trace BP and remove the underlying BP."""
+    ea = int(addr)
+    cfg = _TRACE_BPS.pop(ea, None)
+    if cfg is None:
+        return {"error": f"no trace BP registered at 0x{ea:X}"}
+    ok = ida_dbg.del_bpt(ea)
+    _mcp_log(f"TRACE BP- 0x{ea:X}: {'OK' if ok else 'FAILED'}")
+    return {"success": True, "address": f"0x{ea:X}", "bp_removed": bool(ok)}
+
+
+def dbg_get_trace_log(clear=False):
+    """Return all captured trace records. If clear=True, empty the log."""
+    entries = list(_TRACE_LOG)
+    if clear:
+        _TRACE_LOG.clear()
+    return {"entries": entries, "count": len(entries), "cleared": bool(clear)}
+
+
+def dbg_clear_trace_log():
+    """Empty the trace log without returning entries."""
+    n = len(_TRACE_LOG)
+    _TRACE_LOG.clear()
+    return {"cleared": n}
 
 
 def dbg_list_breakpoints():
@@ -2106,6 +2257,29 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 
         elif path == "/dbg_list_breakpoints":
             return dbg_list_breakpoints()
+
+        elif path == "/dbg_set_trace_bp":
+            addr_str = body.get("address")
+            if not addr_str:
+                return {"error": "Provide 'address'"}
+            return dbg_set_trace_bp(
+                _parse_addr(addr_str),
+                label=body.get("label", ""),
+                addr_reg=body.get("addr_reg", "r8"),
+                size_reg=body.get("size_reg", "r9"),
+            )
+
+        elif path == "/dbg_clear_trace_bp":
+            addr_str = body.get("address")
+            if not addr_str:
+                return {"error": "Provide 'address'"}
+            return dbg_clear_trace_bp(_parse_addr(addr_str))
+
+        elif path == "/dbg_get_trace_log":
+            return dbg_get_trace_log(clear=bool(body.get("clear", False)))
+
+        elif path == "/dbg_clear_trace_log":
+            return dbg_clear_trace_log()
 
         elif path == "/dbg_read_memory":
             addr_str = body.get("address")

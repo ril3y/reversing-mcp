@@ -506,6 +506,64 @@ def dbg_list_breakpoints(idb: str = "") -> dict:
 
 
 @mcp.tool()
+def dbg_set_trace_bp(address: str, label: str = "",
+                     addr_reg: str = "r8", size_reg: str = "r9",
+                     idb: str = "") -> dict:
+    """Arm a NON-PAUSING trace BP that dumps regs + memory on hit.
+
+    Use this instead of dbg_set_breakpoint when reversing protocols that
+    have a timing watchdog (iLok / VMProtect / custom firmware checks).
+    Standard BPs pause the process for hundreds of ms during the MCP
+    roundtrip, which trips the watchdog and corrupts device state.
+    Trace BPs handle the hit inside IDA in microseconds and never pause.
+
+    On each hit the plugin:
+    - reads all common x86_64 registers
+    - reads memory at [addr_reg] for size_reg bytes (Win64 fastcall:
+      arg3=r8, arg4=r9 — that's WinUsb_WritePipe's buf + size)
+    - appends a record to the in-process trace log
+    - resumes the process
+
+    Pull the captured records with dbg_get_trace_log.
+
+    Args:
+        address: hex address to break on (e.g. "0x1814C4BBB")
+        label: free-form tag stored with each dump
+        addr_reg: register holding the data pointer (default r8)
+        size_reg: register holding the size (default r9)
+    """
+    return _call("/dbg_set_trace_bp",
+                 {"address": address, "label": label,
+                  "addr_reg": addr_reg, "size_reg": size_reg},
+                 idb=idb or None)
+
+
+@mcp.tool()
+def dbg_clear_trace_bp(address: str, idb: str = "") -> dict:
+    """Unregister a trace BP and remove the underlying breakpoint."""
+    return _call("/dbg_clear_trace_bp", {"address": address}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_get_trace_log(clear: bool = False, idb: str = "") -> dict:
+    """Return all captured trace-BP hits.
+
+    Returns ``{entries: [...], count: N, cleared: bool}``. Each entry has
+    ``{ts, label, ea, tid, regs, addr, size, data}`` where data is the
+    hex-encoded memory at addr_reg for size_reg bytes.
+
+    Pass clear=True to drain the log atomically (return + reset).
+    """
+    return _call("/dbg_get_trace_log", {"clear": clear}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_clear_trace_log(idb: str = "") -> dict:
+    """Empty the trace log without returning entries."""
+    return _call("/dbg_clear_trace_log", {}, idb=idb or None)
+
+
+@mcp.tool()
 def dbg_read_memory(address: str, size: int = 16, idb: str = "") -> dict:
     """Read live debuggee memory (hex-encoded). Auto-pauses if running.
 
