@@ -564,6 +564,23 @@ def dbg_clear_trace_log(idb: str = "") -> dict:
 
 
 @mcp.tool()
+def reload_plugin(idb: str = "") -> dict:
+    """Re-import the IDA plugin module from disk and restart its HTTP
+    server. Avoids the per-iteration manual ``importlib.reload`` paste
+    in IDA's Python console after every plugin code change.
+
+    The reload runs on a background thread so this call returns first
+    (~0.5s later the server stops, module reloads, server restarts on
+    the same port). The IDB, all breakpoints, and the scratch netnode
+    persist.
+
+    Wait ~1s after this returns before issuing further MCP calls so the
+    new server is up.
+    """
+    return _call("/reload_plugin", {}, idb=idb or None)
+
+
+@mcp.tool()
 def dbg_read_memory(address: str, size: int = 16, idb: str = "") -> dict:
     """Read live debuggee memory (hex-encoded). Auto-pauses if running.
 

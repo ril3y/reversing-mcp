@@ -2351,6 +2351,9 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/dbg_clear_trace_log":
             return dbg_clear_trace_log()
 
+        elif path == "/reload_plugin":
+            return reload_plugin()
+
         elif path == "/dbg_read_memory":
             addr_str = body.get("address")
             size = int(body.get("size", 16))
@@ -2555,6 +2558,70 @@ def stop_server():
     _server = None
     _thread = None
     _reg_path = None
+
+
+def reload_plugin():
+    """Re-import this plugin module from disk, then restart the server.
+
+    Avoids the manual `importlib.reload(...)` paste in IDA's Python
+    console every iteration cycle. Schedules the work on a background
+    thread so the HTTP response can flush BEFORE we shut down the
+    server (otherwise the caller hangs waiting on a dead socket).
+
+    Returns immediately. ~0.5s later: server stops, module is reloaded
+    from disk, server restarts on the same port. The IDB, BPs, and
+    scratch netnode all persist.
+    """
+    import importlib
+    import sys
+
+    def _do_reload():
+        try:
+            time.sleep(0.5)  # let the HTTP response flush
+            # Unhook any DBG_Hooks first so the reloaded module installs
+            # a fresh one instead of fighting with the old subscriber.
+            global _TRACE_HOOK
+            if _TRACE_HOOK is not None:
+                try:
+                    _TRACE_HOOK.unhook()
+                except Exception:
+                    pass
+                _TRACE_HOOK = None
+
+            stop_server()
+
+            # Figure out our own module name — IDA loads us as
+            # ida_mcp_plugin (the file's basename without .py).
+            mod_name = __name__
+            if mod_name == "__main__":
+                # Loaded as a Script File rather than a plugin — find the
+                # right entry in sys.modules by attribute matching.
+                for name, mod in list(sys.modules.items()):
+                    if getattr(mod, "_SCRATCH_NETNODE_NAME", None) == _SCRATCH_NETNODE_NAME:
+                        mod_name = name
+                        break
+
+            mod = sys.modules.get(mod_name)
+            if mod is None:
+                print(f"[MCP] reload: module {mod_name!r} not in sys.modules")
+                return
+
+            print(f"[MCP] reload: re-importing {mod_name!r} from disk...")
+            importlib.reload(mod)
+            # The reloaded module has its own start_server function;
+            # call it through the reloaded namespace to ensure we use
+            # the new code.
+            mod.start_server()
+            print(f"[MCP] reload: done — running new code")
+        except Exception as e:
+            traceback.print_exc()
+            print(f"[MCP] reload FAILED: {type(e).__name__}: {e}")
+
+    threading.Thread(target=_do_reload, name="mcp-reload",
+                     daemon=True).start()
+    return {"success": True,
+            "scheduled": "reload starts in 0.5s",
+            "note": "server stops, module re-imports from disk, server restarts. BPs + scratch persist."}
 
 
 class IdaMcpPlugin(ida_idaapi.plugin_t):
