@@ -13,6 +13,29 @@ A dockable IDA Pro view that renders the per-IDB scratch notebook as live
 markdown with bidirectional links to the IDB. Auto-updates as you make
 discoveries; embedded code blocks pick up renames automatically.
 
+### Streaming-style rendering (UX requirement, NOT decoration)
+
+The viewer must render new content **as it arrives**, not all-at-once. The
+"bam, here's 3000 chars of markdown, now scroll for days" experience is
+exactly what we're avoiding. Agents should be able to stream their thinking
+into the notebook the same way Claude's own output streams — section header,
+then a sentence, then another sentence, then a code block, scrolling along
+with the new content as it lands.
+
+Implementation: this isn't a server-side push; it's just **bridge polling +
+agent chunking**.
+
+- Bridge side: scratch_append (already shipped) lets the agent send arbitrary
+  small chunks. No new endpoint needed for the MVP — but a thin convenience
+  wrapper `scratch_stream(category, [chunk1, chunk2, ...])` that fires the
+  chunks with brief delays makes the agent's intent explicit and the UX
+  smoother.
+- Viewer side: poll the scratch netnode every ~100 ms; if `size` increased,
+  re-render the tail and auto-scroll to the new bottom. (Re-render the
+  *whole* notebook is fine too — typical notebook ~10 KB, rendering is
+  cheap.) Skip auto-scroll if the user has manually scrolled away from
+  the bottom — standard chat-UI pattern.
+
 ### What makes it more than a viewer
 
 - **Live inline code** — markdown source like `{{decompile:0x1814C4AA0}}`
@@ -40,6 +63,11 @@ discoveries; embedded code blocks pick up renames automatically.
 
 - `scratch_show()` — open the viewer.
 - `scratch_refresh()` — force re-render.
+- `scratch_stream(category, chunks: list[str])` — convenience wrapper for
+  streamed sections; fires `scratch_section_start` + N `scratch_append`
+  with small delays so the viewer renders it incrementally rather than
+  all-at-once. Optional — `scratch_append` chained from the agent works
+  equally well; this is just ergonomic sugar.
 
 ### What to steal
 
