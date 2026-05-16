@@ -17,6 +17,7 @@ import traceback
 
 import ida_auto
 import ida_bytes
+import ida_dbg
 import ida_funcs
 import ida_hexrays
 import ida_ida
@@ -694,6 +695,411 @@ def set_segment_attrs_at(addr, name=None, perms_str=None, sclass=None):
 
 
 # ---------------------------------------------------------------------------
+# Debugger control
+#
+# IDA has a full in-tool debugger. Endpoints below cover process attach
+# /detach/launch, run-state control (run/pause/continue/step), breakpoint
+# management, memory + register R/W on the debuggee, and event polling.
+#
+# State machine: ida_dbg.get_process_state() returns one of
+#   ida_dbg.DSTATE_NOTASK   — no debuggee
+#   ida_dbg.DSTATE_RUN      — debuggee running
+#   ida_dbg.DSTATE_SUSP     — debuggee suspended (paused)
+#
+# Read operations (memory, regs, callstack) auto-suspend a running
+# debuggee, read, and resume. Write operations require explicit pause.
+# ---------------------------------------------------------------------------
+
+def _dbg_state_string():
+    """Translate IDA's debugger state enum into a human-readable string."""
+    try:
+        s = ida_dbg.get_process_state()
+    except Exception:
+        return "unknown"
+    if s == ida_dbg.DSTATE_NOTASK:
+        return "detached"
+    if s == ida_dbg.DSTATE_RUN:
+        return "running"
+    if s == ida_dbg.DSTATE_SUSP:
+        return "paused"
+    return f"state_{s}"
+
+
+def dbg_state():
+    """Return the current debugger state + active PID/thread if any."""
+    state = _dbg_state_string()
+    out = {"state": state}
+    if state in ("running", "paused"):
+        try:
+            out["pid"] = idc.get_process_pid()
+        except Exception:
+            pass
+        try:
+            out["tid"] = idc.get_current_thread()
+        except Exception:
+            pass
+        try:
+            out["pc"] = f"0x{idc.get_reg_value('rip' if ida_ida.inf_is_64bit() else 'eip'):X}"
+        except Exception:
+            pass
+    return out
+
+
+def _require_paused():
+    """For ops that need the debuggee paused; return None if OK else error dict."""
+    s = _dbg_state_string()
+    if s == "paused":
+        return None
+    if s == "detached":
+        return {"error": "no active debuggee — call dbg_attach or dbg_launch first"}
+    return {"error": f"debuggee is {s}; call dbg_pause first"}
+
+
+def _auto_suspend_and_run(fn):
+    """Auto-suspend the debuggee if running, call fn, resume if we suspended.
+
+    Used for read-only operations (memory, regs, callstack, modules, threads)
+    so callers don't have to pause manually for cheap reads.
+    """
+    s = _dbg_state_string()
+    if s == "detached":
+        return {"error": "no active debuggee"}
+    resumed = False
+    if s == "running":
+        ida_dbg.suspend_process()
+        ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, 5)
+        resumed = True
+    try:
+        return fn()
+    finally:
+        if resumed:
+            ida_dbg.continue_process()
+
+
+# ---- attach / launch / detach ----
+
+def dbg_attach(pid):
+    """Attach to a running process by PID."""
+    if _dbg_state_string() != "detached":
+        return {"error": f"already attached (state={_dbg_state_string()})"}
+    _mcp_log(f"DBG ATTACH pid={pid}")
+    ok = ida_dbg.attach_process(int(pid), -1)
+    return {"success": int(ok) >= 0, "pid": int(pid), "state": _dbg_state_string()}
+
+
+def dbg_launch(path, args=""):
+    """Launch a new process under the debugger."""
+    if _dbg_state_string() != "detached":
+        return {"error": f"already attached (state={_dbg_state_string()})"}
+    _mcp_log(f"DBG LAUNCH path={path} args={args}")
+    ok = ida_dbg.start_process(path, args, "")
+    return {"success": int(ok) >= 0, "path": path, "state": _dbg_state_string()}
+
+
+def dbg_detach():
+    """Detach from the current debuggee (leaves it running)."""
+    if _dbg_state_string() == "detached":
+        return {"error": "not attached"}
+    _mcp_log("DBG DETACH")
+    ok = ida_dbg.detach_process()
+    return {"success": bool(ok), "state": _dbg_state_string()}
+
+
+def dbg_terminate():
+    """Kill the debuggee."""
+    if _dbg_state_string() == "detached":
+        return {"error": "not attached"}
+    _mcp_log("DBG TERMINATE")
+    ok = ida_dbg.exit_process()
+    return {"success": bool(ok), "state": _dbg_state_string()}
+
+
+# ---- run-state control ----
+
+def dbg_run():
+    """Continue execution (synonym for dbg_continue)."""
+    return dbg_continue()
+
+
+def dbg_pause():
+    """Suspend the running debuggee."""
+    if _dbg_state_string() != "running":
+        return {"error": f"debuggee not running (state={_dbg_state_string()})"}
+    _mcp_log("DBG PAUSE")
+    ida_dbg.suspend_process()
+    ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, 5)
+    return {"success": True, "state": _dbg_state_string()}
+
+
+def dbg_continue():
+    """Resume the paused debuggee."""
+    err = _require_paused()
+    if err: return err
+    _mcp_log("DBG CONTINUE")
+    ida_dbg.continue_process()
+    return {"success": True, "state": _dbg_state_string()}
+
+
+def dbg_step_into():
+    """Single-step into. Returns the new PC."""
+    err = _require_paused()
+    if err: return err
+    _mcp_log("DBG STEP INTO")
+    ida_dbg.step_into()
+    ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, 5)
+    return {"success": True, **dbg_state()}
+
+
+def dbg_step_over():
+    """Single-step over (treats call as one instruction). Returns new PC."""
+    err = _require_paused()
+    if err: return err
+    _mcp_log("DBG STEP OVER")
+    ida_dbg.step_over()
+    ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, 5)
+    return {"success": True, **dbg_state()}
+
+
+def dbg_step_out(timeout_s=30):
+    """Step out of current function — same as 'run until return'."""
+    err = _require_paused()
+    if err: return err
+    _mcp_log("DBG STEP OUT / RUN UNTIL RET")
+    ida_dbg.step_until_ret()
+    ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, timeout_s)
+    return {"success": True, **dbg_state()}
+
+
+def dbg_run_to(addr, timeout_s=30):
+    """Continue until the debuggee hits addr."""
+    err = _require_paused()
+    if err: return err
+    _mcp_log(f"DBG RUN TO 0x{addr:X}")
+    ida_dbg.run_to(addr)
+    ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, timeout_s)
+    return {"success": True, **dbg_state()}
+
+
+# ---- breakpoints ----
+
+_BPT_TYPES = {
+    "sw":       0,  # software exec BP (int3)
+    "hw_exec":  4,  # hardware exec
+    "hw_write": 1,  # hardware write watch
+    "hw_read":  3,  # hardware r/w watch
+    "hw_rw":    3,  # alias
+}
+
+
+def dbg_set_breakpoint(addr, bp_type="sw", size=1):
+    """Add a breakpoint. bp_type in {sw, hw_exec, hw_write, hw_read, hw_rw}."""
+    t = _BPT_TYPES.get(bp_type, 0)
+    # add_bpt(ea) for sw; add_bpt(ea, size, type) for hw watches
+    if bp_type == "sw":
+        ok = ida_dbg.add_bpt(addr)
+    else:
+        ok = ida_dbg.add_bpt(addr, size, t)
+    if ok:
+        _mcp_log(f"DBG BP+ 0x{addr:X} type={bp_type}", addr)
+    else:
+        _mcp_log(f"DBG BP+ 0x{addr:X} type={bp_type}: FAILED")
+    return {"success": bool(ok), "address": f"0x{addr:X}", "type": bp_type}
+
+
+def dbg_del_breakpoint(addr):
+    """Remove the breakpoint at addr."""
+    ok = ida_dbg.del_bpt(addr)
+    _mcp_log(f"DBG BP- 0x{addr:X}: {'OK' if ok else 'FAILED'}")
+    return {"success": bool(ok), "address": f"0x{addr:X}"}
+
+
+def dbg_list_breakpoints():
+    """Return all active breakpoints."""
+    bpts = []
+    n = ida_dbg.get_bpt_qty()
+    for i in range(n):
+        bpt = ida_dbg.bpt_t()
+        if ida_dbg.getn_bpt(i, bpt):
+            bpts.append({
+                "address": f"0x{bpt.ea:X}",
+                "size": bpt.size,
+                "type": bpt.type,
+                "enabled": bool(bpt.flags & ida_dbg.BPT_ENABLED),
+            })
+    return {"breakpoints": bpts}
+
+
+# ---- memory + registers ----
+
+def dbg_read_memory(addr, size):
+    """Read live debuggee memory. Auto-pauses if running."""
+    def _do():
+        data = idc.read_dbg_memory(addr, min(size, 65536))
+        if data is None:
+            return {"error": f"read failed at 0x{addr:X}"}
+        return {"address": f"0x{addr:X}", "size": len(data), "hex": data.hex()}
+    return _auto_suspend_and_run(_do)
+
+
+def dbg_write_memory(addr, hex_data):
+    """Write live debuggee memory. Requires paused."""
+    err = _require_paused()
+    if err: return err
+    try:
+        data = bytes.fromhex(hex_data)
+    except ValueError:
+        return {"error": "hex must be a string of hex digits"}
+    n = idc.write_dbg_memory(addr, data)
+    _mcp_log(f"DBG WRITE 0x{addr:X} {len(data)} bytes -> {n} written", addr)
+    return {"success": int(n) == len(data), "address": f"0x{addr:X}", "written": int(n)}
+
+
+def dbg_get_reg(name):
+    """Read a single register from the debuggee."""
+    def _do():
+        try:
+            v = idc.get_reg_value(name)
+            return {"name": name, "value": f"0x{v:X}"}
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+    return _auto_suspend_and_run(_do)
+
+
+def dbg_set_reg(name, value):
+    """Write a single register. Requires paused."""
+    err = _require_paused()
+    if err: return err
+    idc.set_reg_value(value, name)
+    _mcp_log(f"DBG SET REG {name} = 0x{value:X}")
+    return {"success": True, "name": name, "value": f"0x{value:X}"}
+
+
+def dbg_get_regs():
+    """Return all GP registers of the current thread (auto-pauses)."""
+    if ida_ida.inf_is_64bit():
+        names = ["rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp","rip",
+                 "r8","r9","r10","r11","r12","r13","r14","r15","eflags"]
+    else:
+        names = ["eax","ebx","ecx","edx","esi","edi","ebp","esp","eip","eflags"]
+
+    def _do():
+        out = {}
+        for n in names:
+            try:
+                out[n] = f"0x{idc.get_reg_value(n):X}"
+            except Exception:
+                out[n] = "?"
+        return {"registers": out}
+    return _auto_suspend_and_run(_do)
+
+
+# ---- event poll ----
+
+def dbg_wait_event(timeout_s=30):
+    """Block until the next debug event (BP hit, exception, exit, ...).
+
+    Returns {event, code, pc, message} describing what happened. Useful for
+    'continue then wait for next BP'.
+    """
+    code = ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP | ida_dbg.WFNE_NOWAIT,
+                                       0) if timeout_s == 0 else \
+           ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, timeout_s)
+    out = {"event_code": int(code), "state": _dbg_state_string()}
+    try:
+        if _dbg_state_string() == "paused":
+            out["pc"] = f"0x{idc.get_reg_value('rip' if ida_ida.inf_is_64bit() else 'eip'):X}"
+    except Exception:
+        pass
+    return out
+
+
+# ---- callstack / threads / modules ----
+
+def dbg_callstack():
+    """Return the current thread's call stack frames."""
+    def _do():
+        frames = []
+        try:
+            tid = idc.get_current_thread()
+            cs = idc.get_callstack(tid) if hasattr(idc, "get_callstack") else None
+            if cs:
+                for f in cs:
+                    frames.append({"pc": f"0x{f.pc:X}", "fp": f"0x{f.fp:X}"})
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+        return {"frames": frames}
+    return _auto_suspend_and_run(_do)
+
+
+def dbg_threads():
+    """List threads in the debuggee."""
+    def _do():
+        out = []
+        n = idc.get_thread_qty()
+        for i in range(n):
+            tid = idc.getn_thread(i)
+            out.append({"index": i, "tid": tid})
+        return {"threads": out}
+    return _auto_suspend_and_run(_do)
+
+
+def dbg_modules():
+    """List loaded modules of the debuggee (base, size, name)."""
+    def _do():
+        out = []
+        mod = ida_dbg.modinfo_t()
+        ok = ida_dbg.get_first_module(mod)
+        while ok:
+            out.append({
+                "name": mod.name,
+                "base": f"0x{mod.base:X}",
+                "size": mod.size,
+            })
+            ok = ida_dbg.get_next_module(mod)
+        return {"modules": out}
+    return _auto_suspend_and_run(_do)
+
+
+# ---------------------------------------------------------------------------
+# Hex-Rays local variable manipulation
+#
+# Naming + typing stack locals (v40, Buffer, etc. in pseudocode) gives the
+# biggest readability win for re-decompiles in a debugging session — you can
+# annotate state as you discover it.
+# ---------------------------------------------------------------------------
+
+def rename_local_var(func_addr, old_name, new_name):
+    """Rename a Hex-Rays local variable in a function."""
+    if not ida_hexrays.init_hexrays_plugin():
+        return {"success": False, "error": "Hex-Rays not available"}
+    ok = ida_hexrays.rename_lvar(func_addr, old_name, new_name)
+    _mcp_log(f"LVAR RENAME 0x{func_addr:X} {old_name} -> {new_name}: "
+             f"{'OK' if ok else 'FAILED'}", func_addr)
+    return {"success": bool(ok), "function": f"0x{func_addr:X}",
+            "old_name": old_name, "new_name": new_name}
+
+
+def set_local_var_type(func_addr, var_name, type_decl):
+    """Apply a C type to a Hex-Rays local variable."""
+    if not ida_hexrays.init_hexrays_plugin():
+        return {"success": False, "error": "Hex-Rays not available"}
+
+    tif = ida_typeinf.tinfo_t()
+    decl = type_decl.strip()
+    if not decl.endswith(';'):
+        decl = decl + ' x;'  # parse_decl wants a complete declaration
+    parsed_name = ida_typeinf.parse_decl(tif, None, decl, ida_typeinf.PT_SIL)
+    if not tif.is_well_defined():
+        return {"success": False, "error": f"could not parse type: {type_decl}"}
+
+    ok = ida_hexrays.set_lvar_type(func_addr, var_name, tif)
+    _mcp_log(f"LVAR TYPE 0x{func_addr:X} {var_name} = {type_decl}: "
+             f"{'OK' if ok else 'FAILED'}", func_addr)
+    return {"success": bool(ok), "function": f"0x{func_addr:X}",
+            "name": var_name, "type": type_decl}
+
+
+# ---------------------------------------------------------------------------
 # HTTP request handler
 # ---------------------------------------------------------------------------
 
@@ -937,6 +1343,130 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                     sclass=body.get("class"),
                 )
             return {"error": "Provide 'address'"}
+
+        # --------- Debugger control ---------
+
+        elif path == "/dbg_state":
+            return dbg_state()
+
+        elif path == "/dbg_attach":
+            pid = body.get("pid")
+            if pid is None:
+                return {"error": "Provide 'pid'"}
+            return dbg_attach(int(pid))
+
+        elif path == "/dbg_launch":
+            p = body.get("path")
+            if not p:
+                return {"error": "Provide 'path'"}
+            return dbg_launch(p, body.get("args", ""))
+
+        elif path == "/dbg_detach":
+            return dbg_detach()
+
+        elif path == "/dbg_terminate":
+            return dbg_terminate()
+
+        elif path == "/dbg_run" or path == "/dbg_continue":
+            return dbg_continue()
+
+        elif path == "/dbg_pause":
+            return dbg_pause()
+
+        elif path == "/dbg_step_into":
+            return dbg_step_into()
+
+        elif path == "/dbg_step_over":
+            return dbg_step_over()
+
+        elif path == "/dbg_step_out" or path == "/dbg_run_until_ret":
+            return dbg_step_out(int(body.get("timeout_s", 30)))
+
+        elif path == "/dbg_run_to":
+            addr_str = body.get("address")
+            if not addr_str:
+                return {"error": "Provide 'address'"}
+            return dbg_run_to(_parse_addr(addr_str),
+                              int(body.get("timeout_s", 30)))
+
+        elif path == "/dbg_set_breakpoint":
+            addr_str = body.get("address")
+            if not addr_str:
+                return {"error": "Provide 'address'"}
+            return dbg_set_breakpoint(_parse_addr(addr_str),
+                                      bp_type=body.get("type", "sw"),
+                                      size=int(body.get("size", 1)))
+
+        elif path == "/dbg_del_breakpoint":
+            addr_str = body.get("address")
+            if not addr_str:
+                return {"error": "Provide 'address'"}
+            return dbg_del_breakpoint(_parse_addr(addr_str))
+
+        elif path == "/dbg_list_breakpoints":
+            return dbg_list_breakpoints()
+
+        elif path == "/dbg_read_memory":
+            addr_str = body.get("address")
+            size = int(body.get("size", 16))
+            if not addr_str:
+                return {"error": "Provide 'address'"}
+            return dbg_read_memory(_parse_addr(addr_str), size)
+
+        elif path == "/dbg_write_memory":
+            addr_str = body.get("address")
+            hex_data = body.get("hex", "")
+            if not addr_str:
+                return {"error": "Provide 'address' and 'hex'"}
+            return dbg_write_memory(_parse_addr(addr_str), hex_data)
+
+        elif path == "/dbg_get_reg":
+            name = body.get("name")
+            if not name:
+                return {"error": "Provide 'name'"}
+            return dbg_get_reg(name)
+
+        elif path == "/dbg_set_reg":
+            name = body.get("name")
+            value = body.get("value")
+            if not name or value is None:
+                return {"error": "Provide 'name' and 'value'"}
+            if isinstance(value, str):
+                value = _parse_addr(value)
+            return dbg_set_reg(name, int(value))
+
+        elif path == "/dbg_get_regs":
+            return dbg_get_regs()
+
+        elif path == "/dbg_wait_event":
+            return dbg_wait_event(int(body.get("timeout_s", 30)))
+
+        elif path == "/dbg_callstack":
+            return dbg_callstack()
+
+        elif path == "/dbg_threads":
+            return dbg_threads()
+
+        elif path == "/dbg_modules":
+            return dbg_modules()
+
+        # --------- Hex-Rays local variables ---------
+
+        elif path == "/rename_local_var":
+            func_addr = body.get("function")
+            old_name = body.get("old_name")
+            new_name = body.get("new_name")
+            if not (func_addr and old_name and new_name):
+                return {"error": "Provide 'function', 'old_name', 'new_name'"}
+            return rename_local_var(_parse_addr(func_addr), old_name, new_name)
+
+        elif path == "/set_local_var_type":
+            func_addr = body.get("function")
+            var_name = body.get("name")
+            type_decl = body.get("type")
+            if not (func_addr and var_name and type_decl):
+                return {"error": "Provide 'function', 'name', 'type'"}
+            return set_local_var_type(_parse_addr(func_addr), var_name, type_decl)
 
         else:
             return {"error": f"Unknown endpoint: {path}"}

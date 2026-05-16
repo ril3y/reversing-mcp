@@ -349,6 +349,250 @@ def set_segment_attrs(address: str, name: str = "", perms: str = "",
     return _call("/set_segment_attrs", body, idb=idb or None)
 
 
+# ===========================================================================
+# Debugger control
+# ===========================================================================
+
+@mcp.tool()
+def dbg_state(idb: str = "") -> dict:
+    """Return the current debugger state (detached/paused/running) + PID/PC.
+
+    Args:
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/dbg_state", idb=idb or None)
+
+
+@mcp.tool()
+def dbg_attach(pid: int, idb: str = "") -> dict:
+    """Attach the debugger to a running process by PID.
+
+    Args:
+        pid: Target process ID
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/dbg_attach", {"pid": pid}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_launch(path: str, args: str = "", idb: str = "") -> dict:
+    """Launch a new process under the debugger.
+
+    Args:
+        path: Executable path
+        args: Command-line args (optional)
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/dbg_launch", {"path": path, "args": args}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_detach(idb: str = "") -> dict:
+    """Detach from the current debuggee (it keeps running)."""
+    return _call("/dbg_detach", {}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_terminate(idb: str = "") -> dict:
+    """Kill the debuggee."""
+    return _call("/dbg_terminate", {}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_continue(idb: str = "") -> dict:
+    """Resume execution. Returns when the debuggee suspends again or hits a BP."""
+    return _call("/dbg_continue", {}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_pause(idb: str = "") -> dict:
+    """Suspend the running debuggee."""
+    return _call("/dbg_pause", {}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_step_into(idb: str = "") -> dict:
+    """Single-step into. Calls are followed."""
+    return _call("/dbg_step_into", {}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_step_over(idb: str = "") -> dict:
+    """Single-step over. Calls are treated as one instruction."""
+    return _call("/dbg_step_over", {}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_step_out(timeout_s: int = 30, idb: str = "") -> dict:
+    """Step out of the current function — same as 'run until return'.
+
+    Args:
+        timeout_s: Max seconds to wait before reporting timeout (default 30)
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/dbg_step_out", {"timeout_s": timeout_s}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_run_until_ret(timeout_s: int = 30, idb: str = "") -> dict:
+    """Alias for dbg_step_out — execute until the current function returns."""
+    return _call("/dbg_run_until_ret", {"timeout_s": timeout_s}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_run_to(address: str, timeout_s: int = 30, idb: str = "") -> dict:
+    """Continue execution until the debuggee hits ``address``.
+
+    Args:
+        address: Target address (hex)
+        timeout_s: Max seconds to wait (default 30)
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/dbg_run_to", {"address": address, "timeout_s": timeout_s},
+                 idb=idb or None)
+
+
+@mcp.tool()
+def dbg_set_breakpoint(address: str, type: str = "sw", size: int = 1,
+                       idb: str = "") -> dict:
+    """Add a breakpoint.
+
+    Args:
+        address: Address to break at (hex)
+        type: 'sw' (int3) | 'hw_exec' | 'hw_write' | 'hw_read' | 'hw_rw'
+        size: For hardware watches: range size in bytes (1/2/4/8)
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/dbg_set_breakpoint",
+                 {"address": address, "type": type, "size": size},
+                 idb=idb or None)
+
+
+@mcp.tool()
+def dbg_del_breakpoint(address: str, idb: str = "") -> dict:
+    """Remove the breakpoint at the given address."""
+    return _call("/dbg_del_breakpoint", {"address": address}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_list_breakpoints(idb: str = "") -> dict:
+    """List all active breakpoints with their addresses, sizes, and types."""
+    return _call("/dbg_list_breakpoints", {}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_read_memory(address: str, size: int = 16, idb: str = "") -> dict:
+    """Read live debuggee memory (hex-encoded). Auto-pauses if running.
+
+    Args:
+        address: Start address (hex)
+        size: Number of bytes (max 65536)
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/dbg_read_memory", {"address": address, "size": size},
+                 idb=idb or None)
+
+
+@mcp.tool()
+def dbg_write_memory(address: str, hex: str, idb: str = "") -> dict:
+    """Write live debuggee memory. Requires the debuggee to be paused.
+
+    Args:
+        address: Target address (hex)
+        hex: Bytes to write, as a hex string
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/dbg_write_memory", {"address": address, "hex": hex},
+                 idb=idb or None)
+
+
+@mcp.tool()
+def dbg_get_reg(name: str, idb: str = "") -> dict:
+    """Read a single register (e.g. 'rax', 'rip', 'rcx'). Auto-pauses."""
+    return _call("/dbg_get_reg", {"name": name}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_set_reg(name: str, value: str, idb: str = "") -> dict:
+    """Write a single register. Requires paused.
+
+    Args:
+        name: Register name
+        value: New value (hex string or decimal)
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/dbg_set_reg", {"name": name, "value": value}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_get_regs(idb: str = "") -> dict:
+    """Return all general-purpose registers + flags of the current thread."""
+    return _call("/dbg_get_regs", {}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_wait_event(timeout_s: int = 30, idb: str = "") -> dict:
+    """Block until the next debug event (BP hit, exception, exit, ...).
+
+    Returns ``{event_code, state, pc}``. Useful for 'continue, then wait'.
+    """
+    return _call("/dbg_wait_event", {"timeout_s": timeout_s}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_callstack(idb: str = "") -> dict:
+    """Return the current thread's call stack."""
+    return _call("/dbg_callstack", {}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_threads(idb: str = "") -> dict:
+    """List threads in the debuggee."""
+    return _call("/dbg_threads", {}, idb=idb or None)
+
+
+@mcp.tool()
+def dbg_modules(idb: str = "") -> dict:
+    """List loaded modules of the debuggee (name + base + size)."""
+    return _call("/dbg_modules", {}, idb=idb or None)
+
+
+# ===========================================================================
+# Hex-Rays local variable manipulation
+# ===========================================================================
+
+@mcp.tool()
+def rename_local_var(function: str, old_name: str, new_name: str,
+                     idb: str = "") -> dict:
+    """Rename a Hex-Rays local variable inside a function.
+
+    Args:
+        function: Function start address (hex)
+        old_name: Current name (e.g. 'v40')
+        new_name: New name (e.g. 'Buffer')
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/rename_local_var",
+                 {"function": function, "old_name": old_name, "new_name": new_name},
+                 idb=idb or None)
+
+
+@mcp.tool()
+def set_local_var_type(function: str, name: str, type: str,
+                       idb: str = "") -> dict:
+    """Apply a C type to a Hex-Rays local variable.
+
+    Args:
+        function: Function start address (hex)
+        name: Local variable name
+        type: C type declaration (e.g. 'unsigned char *' or 'struct CaptureCmd')
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/set_local_var_type",
+                 {"function": function, "name": name, "type": type},
+                 idb=idb or None)
+
+
 if __name__ == "__main__":
     if "--list" in sys.argv:
         instances = discover_instances(REG_DIR)
