@@ -247,12 +247,45 @@ Effort: **S** once the unified server is in place.
 
 ## Recently shipped (just so future-you knows what's done)
 
+- **Non-pausing trace BPs (`dbg_set_trace_bp` / `dbg_get_trace_log`)** —
+  beats anti-debug timing watchdogs. `DBG_Hooks.dbg_bpt` subscriber +
+  `BPT_BRK` cleared on the underlying `bpt_t` so IDA fires the BP, runs
+  our register/memory-dump hook in microseconds, and never pauses the
+  process. Validated against iLok-protected `graph_server_shared.dll`:
+  26 wire writes captured during a successful Logic 2 Start Capture
+  (samples actually flowed), where every prior standard-BP attempt
+  caused `devicesetupfailure` from inter-packet gaps > watchdog
+  threshold. **The bridge enhancement that finally unlocked dynamic RE
+  on protected targets.**
+- **`fixed_dumps` for unknown calling conventions** — trace BPs can
+  dump fixed-size regions from multiple registers when you don't yet
+  know which one holds the data. Discovered via this that
+  `Logic2FpgaDevice__SerializeCommand_iLokVM` (the iLok-virtualized
+  serializer at `0x1807CFBB0`) takes **plaintext C++ objects as input**
+  — only its OUTPUT is encrypted. Big strategic implication for Saleae
+  RE: attacking the serializer's input via DLL injection becomes
+  viable.
+- **`/reload_plugin` endpoint** — `importlib.reload`s the plugin from
+  disk via a background thread, restarts the HTTP server, IDB + BPs +
+  scratch all persist. Avoids the manual Python-console paste every
+  iteration cycle. First reload after a plugin change still manual; all
+  subsequent ones one MCP call.
 - **Bridge ergonomics under debug**: `dbg_silence` endpoint (auto-runs on
   attach/launch) that disables `DOPT_EXCDLG` AND marks every known
   exception as pass-through (`EXC_HANDLE` + `EXC_SILENT`, clears
   `EXC_BREAK`). Required for iLok/VMProtect-style protections that throw
   exceptions as normal control flow. Without it, IDA traps the first one
-  and the debuggee can never make progress.
+  and the debuggee can never make progress. Fixed for IDA 8.4 (uses
+  per-exception API: `get_exception_count` + `get_exception_info` +
+  `set_exception_info`).
+- **`dbg_state` cross-thread fix** — `get_process_state()` lags when a
+  BP fires on a worker thread (reports DSTATE_RUN for ~100ms while IDA
+  processes the event). Now cross-checked via `is_debugger_busy()`
+  which catches the UI-pause state regardless of which thread is current.
+- **`dbg_callstack` defensive multi-API probe** — `collect_stacktrace`
+  moves across IDA versions (ida_dbg in 7.x, ida_idd in 8.x, idaapi in
+  some). Probes all three. Falls back to manual RBP-chain walking via
+  `idc.read_dbg_memory` if none expose it.
 - **Per-request audit logging**: every MCP hit logs `[MCP MUT|   ] /path body`
   to IDA's Output window. Slow requests (>1s) log `[MCP SLOW] /path took Xs`.
   Stalled-queue warnings name the path: `[MCP] WARNING: '/decompile' queued for >5s`.

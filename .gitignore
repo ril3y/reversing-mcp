@@ -36,3 +36,6 @@ ghidra/ghidra-mcp-bridge/lib/
 # OS
 .DS_Store
 Thumbs.db
+
+# Session-local trace dumps (per-run debug data, not source)
+trace_log_*.json

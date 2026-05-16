@@ -168,6 +168,79 @@ Mutating the IDA type library / function index / segment table **while the debug
 
 Don't try to skip step 2. The guard refuses for a reason.
 
+### Debugger silencing — auto-runs on `dbg_attach` / `dbg_launch`
+
+Commercial protections (iLok / VMProtect / SmartHeap / custom firmware checks) often **raise structured exceptions as part of normal control flow** AND/OR install dialogs that block IDA's main thread. Without silencing, every exception traps IDA in a loop at the same PC, and modal dialogs wedge every queued MCP request.
+
+`_silence_debugger()` runs automatically inside `dbg_attach` / `dbg_launch`. It:
+
+- Sets `DOPT_EXCDLG` to `EXCDLG_NEVER` — no modal "Exception happened" popup.
+- Iterates every known exception via `ida_dbg.get_exception_count()` + `get_exception_info(i)` + `set_exception_info(...)` (the per-exception API, not the vector form which IDA 8.4 doesn't expose). Clears `EXC_BREAK`, sets `EXC_HANDLE | EXC_SILENT`. Result: exceptions pass through to the target's SEH chain instead of pausing IDA.
+
+If a session pre-dates a plugin load, call `mcp__ida__dbg_silence()` manually. There's also a "Single step execution error" dialog with a "don't display again" checkbox — clicking that suppresses it persistently in IDA's config.
+
+### Anti-watchdog: non-pausing trace BPs (`dbg_set_trace_bp`)
+
+When reversing a protocol with a **timing watchdog** (iLok, VMProtect, FX3 firmware that drops the session if inter-packet gap > X ms), a standard BP+pause+dump+continue cycle takes hundreds of ms per hit and trips the watchdog. The target then refuses subsequent commands with a generic error (Logic 2 surfaced `devicesetupfailure`).
+
+**Trace BPs solve this.** They're real BPs that:
+
+- Fire as usual (CPU interrupt → IDA notified)
+- Have `BPT_BRK` cleared on the underlying `bpt_t` so IDA does NOT pause execution — fall-through is automatic, total pause is microseconds
+- Are routed through a `DBG_Hooks.dbg_bpt()` subscriber that reads registers + dereferences memory at configured pointer/size registers, appends a record to an in-process log, returns immediately
+
+End result: BP fires N times silently during a live capture, log fills up, the target never notices a timing anomaly. **Watchdog defeated** without injecting code or hiding the debugger.
+
+#### Setting up a trace BP
+
+```python
+# MCP-side
+dbg_set_trace_bp(
+    address="0x1814C4BBB",     # WinUsb_WritePipe call site
+    label="WinUsbWrite",       # free-form tag, stored in each record
+    addr_reg="r8",             # Win64 fastcall: arg3 = data pointer
+    size_reg="r9",             #                  arg4 = data size
+)
+# ... run capture, BP fires N times silently ...
+records = dbg_get_trace_log(clear=True)["entries"]
+```
+
+Direct HTTP also works (useful when Claude Code's MCP subprocess holds stale tool wrappers):
+
+```pwsh
+Invoke-RestMethod -Uri "http://127.0.0.1:13337/dbg_set_trace_bp" -Method Post `
+  -Body '{"address":"0x1814C4BBB","label":"WinUsbWrite","addr_reg":"r8","size_reg":"r9"}' `
+  -ContentType "application/json"
+```
+
+#### `fixed_dumps`: multi-pointer capture when you don't know which register holds the data
+
+At a function entry where the calling convention is unknown (typically reversing an internal callee whose vtable doesn't expose the prototype), dump fixed-size regions from every plausibly-pointer-shaped register at once:
+
+```python
+dbg_set_trace_bp(
+    address="0x1807CFBB0",     # function entry
+    label="serializer_entry",
+    addr_reg="", size_reg="",  # disable the addr+size mode
+    fixed_dumps=[
+        {"reg": "rcx", "size": 128},   # arg1
+        {"reg": "rdx", "size": 256},   # arg2
+        {"reg": "r8",  "size": 256},   # arg3
+        {"reg": "r9",  "size": 64},    # arg4 (often a size — but try anyway)
+    ],
+)
+```
+
+Each register is read; if its value is in user-mode address range (`0x10000 <= ptr < 0x7FFFFFFFFFFF`), the configured size is dumped. Otherwise the record notes `"skip": "not pointer-shaped"`.
+
+This is how we discovered (2026-05-16) that `Logic2FpgaDevice__SerializeCommand_iLokVM` takes **plaintext input** — the device-name string `"Logic Pro 16"` appeared in RCX's dump even though the function's output is iLok-encrypted.
+
+### `reload_plugin` — iterating on the plugin without restarting IDA
+
+After editing `ida/plugin.py` and re-syncing it to IDA's plugins folder, call `mcp__ida__reload_plugin()` (or POST to `/reload_plugin`). It schedules a background-thread `importlib.reload(...)` of the plugin module — server stops, module re-imports from disk, server restarts on the same port within ~0.5s. The IDB, all breakpoints, and the scratch netnode persist.
+
+**Caveat**: the FIRST reload after a plugin change still requires either a manual `importlib.reload` paste OR a full IDA restart, because the OLD plugin doesn't have the `/reload_plugin` endpoint yet. Every subsequent iteration is one MCP call. `Ctrl+Shift+M` toggling the plugin via IDA's menu only restarts the HTTP server — it does NOT re-import the .py from disk.
+
 ## WIP branches
 
 The `unicorn/`, `saleae_native/`, `cookbooks/`, and `tests/test_unicorn_server.py` paths
