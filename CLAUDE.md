@@ -151,6 +151,11 @@ If during analysis you discover **any** of these, persist it *before* moving on:
 | State change / non-obvious behavior / DRM observation at an address | `add_comment` (use `repeatable=true` so the comment shows at all xrefs) |
 | Hex-Rays local-variable purpose | `rename_local_var` (+ `set_local_var_type` if you also know the type) |
 | Whole memory region's meaning (e.g. MMIO range, runtime-allocated VM area) | `add_segment` + `set_segment_attrs` |
+| Cross-cutting insight / hypothesis / discovery not anchored to one address | `scratch_log(category, content)` — appends a timestamped markdown section to a persistent per-IDB lab notebook |
+
+The `scratch_*` endpoints (`scratch_read` / `scratch_log` / `scratch_append` / `scratch_replace` / `scratch_clear`) store free-form markdown in a netnode inside the IDB. The notebook auto-saves with the IDB and accumulates across sessions, so a future Claude session in the same IDB can `scratch_read` and immediately know what previous sessions discovered. Use `scratch_log` for the common case of "remember this for next time"; categories like `Discovery`, `Hypothesis`, `Open question`, `Dynamic capture` help future search.
+
+**Start every fresh session in an IDB with `scratch_read`** — that's how prior context gets handed forward.
 
 ### Debugger safety — mutations are blocked while attached
 

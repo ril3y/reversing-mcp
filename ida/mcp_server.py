@@ -593,6 +593,68 @@ def set_local_var_type(function: str, name: str, type: str,
                  idb=idb or None)
 
 
+# ===========================================================================
+# Per-IDB scratch / lab notebook
+#
+# Persistent free-form markdown buffer stored inside the IDB (in a named
+# netnode). Auto-saves with the IDB; survives IDA restarts; multiple
+# sessions can append to it. Use scratch_log for the common case of
+# 'remember this discovery for next time'.
+# ===========================================================================
+
+@mcp.tool()
+def scratch_read(idb: str = "") -> dict:
+    """Return the current scratch / lab-notebook markdown for this IDB.
+
+    Args:
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/scratch_read", {}, idb=idb or None)
+
+
+@mcp.tool()
+def scratch_log(category: str, content: str, idb: str = "") -> dict:
+    """Append a timestamped markdown section to the IDB scratch.
+
+    The most-common entry point. Output format:
+
+        ## [2026-05-16 14:32:08 UTC] {category}
+
+        {content}
+
+    Args:
+        category: Short heading (e.g. 'Discovery', 'Dynamic capture',
+                  'Hypothesis', 'Open question').
+        content: Free-form markdown body (multi-line OK).
+        idb: IDB filename substring to target (optional)
+    """
+    return _call("/scratch_log",
+                 {"category": category, "content": content},
+                 idb=idb or None)
+
+
+@mcp.tool()
+def scratch_append(text: str, idb: str = "") -> dict:
+    """Append raw text (no timestamp/heading) to the scratch.
+
+    Use scratch_log for normal entries; scratch_append is for fine
+    control when you're building up a multi-piece markdown structure.
+    """
+    return _call("/scratch_append", {"text": text}, idb=idb or None)
+
+
+@mcp.tool()
+def scratch_replace(content: str, idb: str = "") -> dict:
+    """Replace the entire scratch with new markdown."""
+    return _call("/scratch_replace", {"content": content}, idb=idb or None)
+
+
+@mcp.tool()
+def scratch_clear(idb: str = "") -> dict:
+    """Empty the scratch buffer entirely. Irreversible."""
+    return _call("/scratch_clear", {}, idb=idb or None)
+
+
 if __name__ == "__main__":
     if "--list" in sys.argv:
         instances = discover_instances(REG_DIR)

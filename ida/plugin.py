@@ -14,6 +14,7 @@ import os
 import socket
 import threading
 import traceback
+from datetime import datetime, timezone
 
 import ida_auto
 import ida_bytes
@@ -24,6 +25,7 @@ import ida_ida
 import ida_idaapi
 import ida_idd
 import ida_kernwin
+import ida_netnode
 import ida_lines
 import ida_name
 import ida_nalt
@@ -1141,6 +1143,79 @@ def set_local_var_type(func_addr, var_name, type_decl):
 
 
 # ---------------------------------------------------------------------------
+# Per-IDB scratch / lab notebook
+#
+# Persistent free-form markdown buffer stored in a named netnode inside the
+# IDB ($ reversing_mcp_scratch). Auto-saved with the IDB, survives IDA
+# restarts, accumulates discoveries across sessions. Use scratch_log to
+# append a timestamped section — that's the most-common entry point.
+# ---------------------------------------------------------------------------
+
+_SCRATCH_NETNODE_NAME = "$ reversing_mcp_scratch"
+_SCRATCH_TAG = ord('M')  # blob tag — "M" for MCP
+
+
+def _scratch_node():
+    """Get-or-create the netnode that stores the scratch markdown."""
+    return ida_netnode.netnode(_SCRATCH_NETNODE_NAME, 0, True)
+
+
+def scratch_read():
+    """Return current scratch content as markdown text."""
+    try:
+        node = _scratch_node()
+        data = node.getblob(0, _SCRATCH_TAG)
+        if data is None:
+            return {"content": "", "size": 0}
+        if isinstance(data, bytes):
+            text = data.decode("utf-8", errors="replace")
+        else:
+            text = str(data)
+        return {"content": text, "size": len(text)}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def scratch_replace(content):
+    """Replace the entire scratch buffer."""
+    try:
+        node = _scratch_node()
+        data = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        node.setblob(data, 0, _SCRATCH_TAG)
+        _mcp_log(f"SCRATCH REPLACE: {len(data)} bytes")
+        return {"success": True, "size": len(data)}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def scratch_append(text):
+    """Append raw text to the scratch buffer."""
+    current = scratch_read()
+    if "error" in current:
+        return current
+    return scratch_replace(current["content"] + text)
+
+
+def scratch_log(category, content):
+    """Append a timestamped markdown section. The most-common entry point.
+
+    Output format:
+
+      ## [2026-05-16 14:32:08 UTC] {category}
+
+      {content}
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    entry = f"\n\n## [{ts}] {category}\n\n{content}\n"
+    return scratch_append(entry)
+
+
+def scratch_clear():
+    """Empty the scratch buffer entirely."""
+    return scratch_replace("")
+
+
+# ---------------------------------------------------------------------------
 # HTTP request handler
 # ---------------------------------------------------------------------------
 
@@ -1208,6 +1283,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         "/make_code", "/define_type", "/apply_type",
         "/set_function_prototype", "/add_segment", "/set_segment_attrs",
         "/rename_local_var", "/set_local_var_type",
+        "/scratch_replace", "/scratch_append", "/scratch_log", "/scratch_clear",
     })
 
     def _dispatch(self, path, body):
@@ -1522,6 +1598,27 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             if not (func_addr and var_name and type_decl):
                 return {"error": "Provide 'function', 'name', 'type'"}
             return set_local_var_type(_parse_addr(func_addr), var_name, type_decl)
+
+        # --------- Scratch / lab-notebook ---------
+
+        elif path == "/scratch_read":
+            return scratch_read()
+
+        elif path == "/scratch_replace":
+            content = body.get("content", "")
+            return scratch_replace(content)
+
+        elif path == "/scratch_append":
+            text = body.get("text", "")
+            return scratch_append(text)
+
+        elif path == "/scratch_log":
+            category = body.get("category", "Note")
+            content = body.get("content", "")
+            return scratch_log(category, content)
+
+        elif path == "/scratch_clear":
+            return scratch_clear()
 
         else:
             return {"error": f"Unknown endpoint: {path}"}
