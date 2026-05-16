@@ -723,17 +723,36 @@ def set_segment_attrs_at(addr, name=None, perms_str=None, sclass=None):
 # ---------------------------------------------------------------------------
 
 def _dbg_state_string():
-    """Translate IDA's debugger state enum into a human-readable string."""
+    """Translate IDA's debugger state enum into a human-readable string.
+
+    `ida_dbg.get_process_state()` can lag behind reality — specifically,
+    when a BP fires on a worker thread, the function may still report
+    DSTATE_RUN for a brief window while IDA processes the event. To
+    catch the discrepancy we ALSO check `is_debugger_busy()` (true while
+    IDA is showing a pause-state in the UI) and treat that as "paused".
+
+    Observed 2026-05-16: HandleStartCapture BP fired on a worker thread,
+    IDA's UI showed the pause, but get_process_state() returned DSTATE_RUN.
+    `is_debugger_busy()` was True in that scenario.
+    """
     try:
         s = ida_dbg.get_process_state()
     except Exception:
         return "unknown"
     if s == ida_dbg.DSTATE_NOTASK:
         return "detached"
-    if s == ida_dbg.DSTATE_RUN:
-        return "running"
     if s == ida_dbg.DSTATE_SUSP:
         return "paused"
+    # DSTATE_RUN per get_process_state — but double-check via is_debugger_busy
+    # which catches the case where a thread is paused at a BP but the
+    # process-state hasn't transitioned yet.
+    try:
+        if hasattr(ida_dbg, "is_debugger_busy") and ida_dbg.is_debugger_busy():
+            return "paused"
+    except Exception:
+        pass
+    if s == ida_dbg.DSTATE_RUN:
+        return "running"
     return f"state_{s}"
 
 
@@ -827,15 +846,42 @@ def _pass_all_exceptions():
     without this, IDA traps every exception and execution loops at
     the same PC forever.
 
-    IDA exposes get/set_exceptions via different names across versions;
-    we probe a couple. Returns count of types changed, or 0 if the API
-    surface wasn't found.
+    IDA 8.4 exposes the per-exception form (get/set_exception_info +
+    get_exception_count). Older versions had a vector form
+    (get/set_exceptions). We try the per-exception form first and fall
+    back to the vector form. Returns count of types changed.
     """
-    pairs = [
-        ("get_exceptions", "set_exceptions"),
-        ("dbg_get_exceptions", "dbg_set_exceptions"),
-    ]
-    for get_name, set_name in pairs:
+    EXC_BREAK = getattr(ida_dbg, "EXC_BREAK", 0x0001)
+    EXC_HANDLE = getattr(ida_dbg, "EXC_HANDLE", 0x0002)
+    EXC_SILENT = getattr(ida_dbg, "EXC_SILENT", 0x0008)
+
+    # --- Method 1: per-exception API (IDA 8.4+) ---
+    have_per_exc = (
+        hasattr(ida_dbg, "get_exception_count")
+        and hasattr(ida_dbg, "get_exception_info")
+        and hasattr(ida_dbg, "set_exception_info")
+    )
+    if have_per_exc:
+        try:
+            n = ida_dbg.get_exception_count()
+            changed = 0
+            for i in range(n):
+                exc = ida_dbg.get_exception_info(i)
+                if exc is None:
+                    continue
+                new_flags = (exc.flags & ~EXC_BREAK) | EXC_HANDLE | EXC_SILENT
+                if new_flags != exc.flags:
+                    exc.flags = new_flags
+                    ida_dbg.set_exception_info(exc)
+                    changed += 1
+            _mcp_log(f"DBG pass-through (per-exception API): set {changed}/{n} exception types")
+            return changed
+        except Exception as e:
+            _mcp_log(f"DBG pass-through (per-exception) failed: {type(e).__name__}: {e}")
+
+    # --- Method 2: vector form (older IDA) ---
+    for get_name, set_name in (("get_exceptions", "set_exceptions"),
+                                ("dbg_get_exceptions", "dbg_set_exceptions")):
         getter = getattr(ida_dbg, get_name, None)
         setter = getattr(ida_dbg, set_name, None)
         if not (getter and setter):
@@ -846,16 +892,17 @@ def _pass_all_exceptions():
                 continue
             changed = 0
             for exc in excs:
-                new_flags = (exc.flags & ~_EXC_BREAK) | _EXC_HANDLE | _EXC_SILENT
+                new_flags = (exc.flags & ~EXC_BREAK) | EXC_HANDLE | EXC_SILENT
                 if new_flags != exc.flags:
                     exc.flags = new_flags
                     changed += 1
             setter(excs)
-            _mcp_log(f"DBG pass-through enabled on {changed}/{len(excs)} exception types")
+            _mcp_log(f"DBG pass-through (vector API): set {changed}/{len(excs)} exception types")
             return changed
         except Exception as e:
-            _mcp_log(f"DBG pass-through via {get_name} failed: {type(e).__name__}: {e}")
-    _mcp_log("DBG pass-through: get_exceptions/set_exceptions API not exposed")
+            _mcp_log(f"DBG pass-through (vector {get_name}) failed: {type(e).__name__}: {e}")
+
+    _mcp_log("DBG pass-through: NO exception API surface found in ida_dbg")
     return 0
 
 
@@ -1176,6 +1223,7 @@ def dbg_callstack():
         # Fallback: walk the RBP chain manually. Works only when the
         # target was compiled with frame pointers. Most modern MSVC code
         # uses /Oy- selectively, so we get partial frames at best.
+        # Uses idc.read_dbg_memory (cleaner 2-arg signature: addr, size).
         try:
             frames = []
             rip = ida_dbg.get_reg_val("rip")
@@ -1192,8 +1240,8 @@ def dbg_callstack():
                     break
                 # [rbp]   = saved RBP
                 # [rbp+8] = saved RIP (return address)
-                ret_bytes = ida_dbg.read_dbg_memory(rbp + 8, 8)
-                next_bp_bytes = ida_dbg.read_dbg_memory(rbp, 8)
+                ret_bytes = idc.read_dbg_memory(rbp + 8, 8)
+                next_bp_bytes = idc.read_dbg_memory(rbp, 8)
                 if not ret_bytes or not next_bp_bytes:
                     break
                 ret = int.from_bytes(ret_bytes, "little")
