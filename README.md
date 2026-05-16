@@ -2,43 +2,76 @@
 
 MCP servers that give Claude Code direct access to IDA Pro, Ghidra, jadx (Android/Java), ILSpy (.NET), and Unicorn Engine (emulator). Disassemble, decompile, rename, comment, search, navigate, and emulate without leaving your terminal.
 
-## Quick Start (Claude Code)
+## Install
 
-### 1. Install Python dependencies
+### 1. Clone + Python deps
 
 ```bash
+git clone https://github.com/ril3y/reversing-mcp.git
+cd reversing-mcp
 pip install mcp httpx
 ```
 
-### 2. Add to your MCP config
+### 2. Register the MCP servers with Claude Code
 
-**One-liner** (registers every server in your global Claude Code config):
+Pick the line that matches your shell. **Both lines use the four stable servers
+on `main`** — `unicorn` and `saleae_native` live on WIP branches (see
+[WIP branches](#wip-branches) below) and are not registered by default.
+
+**Linux / macOS / Git Bash** (run from the repo root):
 
 ```bash
-for tool in ghidra ida jadx ilspy unicorn; do
-  claude mcp add -s user "$tool" -- python3 /path/to/reversing-mcp/$tool/mcp_server.py
+REPO=$(pwd)
+for tool in ida ghidra jadx ilspy; do
+  claude mcp add -s user "$tool" -- python "$REPO/$tool/mcp_server.py"
 done
 ```
 
-Or manually add to `~/.claude/.mcp.json`:
+**Windows PowerShell** (run from the repo root):
 
-```json
-{
-  "mcpServers": {
-    "ghidra":  { "command": "python3", "args": ["/path/to/reversing-mcp/ghidra/mcp_server.py"] },
-    "ida":     { "command": "python3", "args": ["/path/to/reversing-mcp/ida/mcp_server.py"] },
-    "jadx":    { "command": "python3", "args": ["/path/to/reversing-mcp/jadx/mcp_server.py"] },
-    "ilspy":   { "command": "python3", "args": ["/path/to/reversing-mcp/ilspy/mcp_server.py"] },
-    "unicorn": { "command": "python3", "args": ["/path/to/reversing-mcp/unicorn/mcp_server.py"] }
-  }
+```powershell
+$repo = (Get-Location).Path
+foreach ($tool in 'ida','ghidra','jadx','ilspy') {
+  claude mcp add -s user $tool -- python "$repo/$tool/mcp_server.py"
 }
 ```
 
-Replace `/path/to/reversing-mcp` with the actual clone path. You only need the servers for tools you use.
+> On Windows the launcher is `python` (not `python3`). If `python --version`
+> shows the wrong interpreter, substitute an absolute path like
+> `C:\Python312\python.exe`.
 
-### 3. Install the in-tool bridge
+Or — if you'd rather edit your config directly — add this to `~/.claude.json`
+(or `~/.claude/.mcp.json`) under `"mcpServers"`, with `/path/to/reversing-mcp`
+replaced by your absolute clone path:
+
+```json
+{
+  "ida":    { "command": "python", "args": ["/path/to/reversing-mcp/ida/mcp_server.py"] },
+  "ghidra": { "command": "python", "args": ["/path/to/reversing-mcp/ghidra/mcp_server.py"] },
+  "jadx":   { "command": "python", "args": ["/path/to/reversing-mcp/jadx/mcp_server.py"] },
+  "ilspy":  { "command": "python", "args": ["/path/to/reversing-mcp/ilspy/mcp_server.py"] }
+}
+```
+
+### 3. Verify
+
+```bash
+claude mcp list
+```
+
+You should see all four marked `✓ Connected`. If a server isn't connecting,
+launch its `mcp_server.py` manually — any traceback (missing `mcp` or `httpx`
+packages, wrong Python, etc.) will print to stderr.
+
+> The MCP server connecting only means the **stdio glue is alive** — it does
+> *not* mean a bridge is running inside IDA/Ghidra/jadx/ILSpy. Open one of
+> those tools (with the bridge installed per step 4) before you make calls,
+> or each tool will return `"No <Tool> instances found."`.
+
+### 4. Install the in-tool bridge
 
 You need a bridge running inside each RE tool so the MCP server can talk to it.
+Install only the bridges for the tools you actually use.
 
 #### Ghidra (Extension — recommended)
 
@@ -58,10 +91,23 @@ If you prefer not to install an extension, copy `ghidra/bridge.java` to your `gh
 
 #### IDA Pro
 
+Drop `ida/plugin.py` into your IDA user plugins directory and restart IDA — the
+plugin auto-starts when an IDB loads and binds `Ctrl+Shift+M` to toggle it.
+
+**Linux / macOS**:
 ```bash
-# Symlink plugin into IDA (starts automatically on load)
 ln -sf "$(pwd)/ida/plugin.py" ~/.idapro/plugins/ida_mcp_plugin.py
 ```
+
+**Windows PowerShell**:
+```powershell
+$plugins = "$env:APPDATA\Hex-Rays\IDA Pro\plugins"
+New-Item -ItemType Directory -Force $plugins | Out-Null
+Copy-Item ida\plugin.py "$plugins\ida_mcp_plugin.py"
+```
+
+The Output window will print `[MCP] Server started on http://127.0.0.1:13337`
+when the bridge is up. Verify from a shell with `python ida/mcp_server.py --list`.
 
 #### jadx (standalone Java bridge)
 
@@ -101,7 +147,7 @@ The bridge writes `~/.unicorn_mcp/<pid>.json` with `{pid, port, arch}`. Target w
 
 Supported archs: `thumb`, `arm`, `arm64`, `x86`, `x86_64`, `mips`, `mipsel`, `mips64`, `riscv32`, `riscv64`.
 
-### 4. Use it
+### 5. Use it
 
 Open a binary in Ghidra or IDA, then ask Claude Code to analyze it:
 
