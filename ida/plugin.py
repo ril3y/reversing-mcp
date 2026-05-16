@@ -1125,29 +1125,92 @@ def dbg_wait_event(timeout_s=30):
 def dbg_callstack():
     """Return the current thread's call stack frames.
 
-    Uses ida_dbg.collect_stacktrace which fills an ida_idd.call_stack_t
-    container. Frames have .pc (instruction pointer) and .fp (frame pointer).
+    The `collect_stacktrace` function moved across IDA versions:
+    - IDA 7.x: ida_dbg.collect_stacktrace
+    - IDA 8.x: ida_idd.collect_stacktrace (where call_stack_t lives)
+    - some builds: only via idaapi
+
+    We probe in order. If none expose it, we fall back to a manual RBP
+    chain walk via read_dbg_memory — fragile (fails on -fomit-frame-pointer
+    builds, which most modern MSVC code is) but better than nothing for
+    the cases where it DOES work.
     """
     def _do():
-        frames = []
         try:
             tid = idc.get_current_thread()
-            trace = ida_idd.call_stack_t()
-            ok = ida_dbg.collect_stacktrace(trace, tid)
-            if not ok:
-                return {"frames": [], "note": "collect_stacktrace returned False"}
-            for i in range(trace.size()):
-                frame = trace.at(i)
-                frames.append({
-                    "depth": i,
-                    "pc": f"0x{frame.pc:X}",
-                    "fp": f"0x{frame.fp:X}" if hasattr(frame, "fp") else "0",
-                    "name": ida_name.get_name(frame.pc) or "",
-                })
         except Exception as e:
-            return {"error": f"{type(e).__name__}: {e}",
-                    "frames": frames}  # whatever we collected before the error
-        return {"frames": frames}
+            return {"error": f"get_current_thread: {type(e).__name__}: {e}"}
+
+        # Probe for collect_stacktrace across modules.
+        for mod_name in ("ida_dbg", "ida_idd", "idaapi"):
+            mod = globals().get(mod_name)
+            if mod is None:
+                try:
+                    mod = __import__(mod_name)
+                except Exception:
+                    continue
+            fn = getattr(mod, "collect_stacktrace", None)
+            cls = getattr(ida_idd, "call_stack_t", None) or getattr(mod, "call_stack_t", None)
+            if not (fn and cls):
+                continue
+            try:
+                trace = cls()
+                ok = fn(trace, tid)
+                if not ok:
+                    continue
+                frames = []
+                for i in range(trace.size()):
+                    f = trace.at(i)
+                    pc = int(f.pc)
+                    frames.append({
+                        "depth": i,
+                        "pc": f"0x{pc:X}",
+                        "fp": f"0x{int(f.fp):X}" if hasattr(f, "fp") else "0",
+                        "name": ida_name.get_name(pc) or "",
+                    })
+                return {"frames": frames, "method": f"{mod_name}.collect_stacktrace"}
+            except Exception as e:
+                _mcp_log(f"DBG callstack via {mod_name}.collect_stacktrace failed: {type(e).__name__}: {e}")
+                continue
+
+        # Fallback: walk the RBP chain manually. Works only when the
+        # target was compiled with frame pointers. Most modern MSVC code
+        # uses /Oy- selectively, so we get partial frames at best.
+        try:
+            frames = []
+            rip = ida_dbg.get_reg_val("rip")
+            rbp = ida_dbg.get_reg_val("rbp")
+            frames.append({
+                "depth": 0,
+                "pc": f"0x{rip:X}",
+                "fp": f"0x{rbp:X}",
+                "name": ida_name.get_name(rip) or "",
+            })
+            # Walk a few frames; stop if pointers look bogus.
+            for depth in range(1, 32):
+                if rbp == 0 or rbp < 0x10000 or rbp > 0x00007FFFFFFFFFFF:
+                    break
+                # [rbp]   = saved RBP
+                # [rbp+8] = saved RIP (return address)
+                ret_bytes = ida_dbg.read_dbg_memory(rbp + 8, 8)
+                next_bp_bytes = ida_dbg.read_dbg_memory(rbp, 8)
+                if not ret_bytes or not next_bp_bytes:
+                    break
+                ret = int.from_bytes(ret_bytes, "little")
+                rbp = int.from_bytes(next_bp_bytes, "little")
+                if ret == 0:
+                    break
+                frames.append({
+                    "depth": depth,
+                    "pc": f"0x{ret:X}",
+                    "fp": f"0x{rbp:X}",
+                    "name": ida_name.get_name(ret) or "",
+                })
+            return {"frames": frames, "method": "manual_rbp_walk",
+                    "note": "best-effort — unreliable on /Oy code"}
+        except Exception as e:
+            return {"error": f"manual walk failed: {type(e).__name__}: {e}",
+                    "frames": []}
     return _auto_suspend_and_run(_do)
 
 
