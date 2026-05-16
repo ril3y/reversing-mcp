@@ -1101,6 +1101,13 @@ _TRACE_REGS = ("rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
 def _trace_capture(cfg, bptea, tid):
     """Read regs + memory on a trace BP hit. Runs in IDA's debugger
     callback context — must be fast and must not raise.
+
+    Two dump modes (both optional, can combine):
+      - addr_reg + size_reg: pointer + size both from registers
+        (e.g. WinUsb_WritePipe: r8=buf, r9=size)
+      - fixed_dumps: list of {"reg": "rdx", "size": 128} entries —
+        dump fixed N bytes from each register. Use this when you don't
+        know which register holds the data pointer yet.
     """
     record = {
         "ts": time.time(),
@@ -1125,14 +1132,40 @@ def _trace_capture(cfg, bptea, tid):
                 size = idc.get_reg_value(size_reg)
                 record["addr"] = f"0x{addr:X}"
                 record["size"] = int(size)
-                # Clamp size to prevent runaway reads if a register holds
-                # a bogus value.
                 if 0 < size < 65536:
                     data = idc.read_dbg_memory(addr, int(size))
                     if data:
                         record["data"] = data.hex()
             except Exception as e:
                 record["mem_error"] = f"{type(e).__name__}: {e}"
+
+        # fixed_dumps: list of {reg, size} — dump N bytes treating reg as ptr.
+        # Useful when we don't yet know which reg holds the data; just dump
+        # everything plausibly-pointer-ish.
+        fixed = cfg.get("fixed_dumps") or []
+        if fixed:
+            dumps = {}
+            for spec in fixed:
+                reg = spec.get("reg")
+                sz = int(spec.get("size", 64))
+                if not reg or sz <= 0 or sz > 65536:
+                    continue
+                try:
+                    ptr = idc.get_reg_value(reg)
+                    if ptr < 0x10000 or ptr > 0x00007FFFFFFFFFFF:
+                        dumps[reg] = {"ptr": f"0x{ptr:X}", "skip": "not pointer-shaped"}
+                        continue
+                    data = idc.read_dbg_memory(ptr, sz)
+                    if data:
+                        dumps[reg] = {"ptr": f"0x{ptr:X}", "size": sz,
+                                      "data": data.hex()}
+                    else:
+                        dumps[reg] = {"ptr": f"0x{ptr:X}", "size": sz,
+                                      "data": ""}
+                except Exception as e:
+                    dumps[reg] = {"ptr": f"0x{ptr:X}" if 'ptr' in locals() else "?",
+                                  "error": f"{type(e).__name__}: {e}"}
+            record["fixed_dumps"] = dumps
     except Exception as e:
         record["error"] = f"{type(e).__name__}: {e}"
     return record
@@ -1166,29 +1199,65 @@ def _ensure_trace_hook():
         _mcp_log("DBG trace-BP hook installed")
 
 
-def dbg_set_trace_bp(addr, label="", addr_reg="r8", size_reg="r9"):
+_BPT_BRK = 0x001  # "break on hit" flag on a bpt_t
+
+
+def dbg_set_trace_bp(addr, label="", addr_reg="r8", size_reg="r9",
+                     fixed_dumps=None):
     """Arm a non-pausing trace BP. On hit, dumps registers + memory
-    pointed to by addr_reg/size_reg, appends to the trace log, and
-    auto-continues.
+    pointed to by addr_reg/size_reg AND/OR fixed_dumps regions, appends
+    to the trace log, and auto-continues.
+
+    Non-pausing mechanism: clear the BPT_BRK flag on the BP itself.
+    With BPT_BRK off, IDA fires the BP (CPU interrupt happens, our
+    dbg_bpt hook still receives the event) but does NOT pause the
+    process — fall-through is automatic. Just returning NOSTOP from
+    dbg_bpt is NOT sufficient — that controls "remove the BP" not
+    "skip the pause".
 
     Args:
         addr: address to break on
         label: free-form tag stored with each dump record
         addr_reg: register holding the data pointer (default r8 = arg3
                   in Win64 fastcall — matches WinUsb_WritePipe's buf)
-        size_reg: register holding the data size (default r9 = arg4)
+        size_reg: register holding the data size (default r9 = arg4).
+                  Pass "" to disable the addr+size mode.
+        fixed_dumps: optional list of {"reg": "rdx", "size": 128} entries.
+                     Each will be treated as a pointer and dumped at fixed
+                     size. Use when you don't yet know which register holds
+                     the data — dump multiple candidates at once.
     """
     _ensure_trace_hook()
-    ok = ida_dbg.add_bpt(int(addr))
-    # If add_bpt returns False the BP may already exist; treat as success
-    # since the user's intent is "I want this address to be a trace BP".
-    _TRACE_BPS[int(addr)] = {"label": label,
-                              "addr_reg": addr_reg,
-                              "size_reg": size_reg}
-    _mcp_log(f"TRACE BP+ 0x{int(addr):X} label='{label}' "
-             f"addr_reg={addr_reg} size_reg={size_reg}")
-    return {"success": True, "address": f"0x{int(addr):X}",
+    ea = int(addr)
+    ok = ida_dbg.add_bpt(ea)
+    # add_bpt returns False if the BP already exists — accept that since
+    # the user's intent is "this address should be a trace BP".
+
+    # Clear BPT_BRK so this BP logs without pausing. This is THE critical
+    # bit — DBG_Hooks.dbg_bpt return value alone won't suppress the pause.
+    cleared_brk = False
+    try:
+        flags = idc.get_bpt_attr(ea, idc.BPTATTR_FLAGS)
+        new_flags = flags & ~_BPT_BRK
+        if new_flags != flags:
+            idc.set_bpt_attr(ea, idc.BPTATTR_FLAGS, new_flags)
+            cleared_brk = True
+    except Exception as e:
+        _mcp_log(f"TRACE BP could not clear BPT_BRK at 0x{ea:X}: "
+                 f"{type(e).__name__}: {e}")
+
+    _TRACE_BPS[ea] = {"label": label,
+                      "addr_reg": addr_reg,
+                      "size_reg": size_reg,
+                      "fixed_dumps": fixed_dumps or []}
+    _mcp_log(f"TRACE BP+ 0x{ea:X} label='{label}' "
+             f"addr_reg={addr_reg} size_reg={size_reg} "
+             f"fixed_dumps={len(fixed_dumps or [])} "
+             f"brk_cleared={cleared_brk}")
+    return {"success": True, "address": f"0x{ea:X}",
             "label": label, "bp_added": bool(ok),
+            "brk_cleared": cleared_brk,
+            "fixed_dumps": fixed_dumps or [],
             "note": "non-pausing — call dbg_get_trace_log to retrieve hits"}
 
 
@@ -2267,6 +2336,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 label=body.get("label", ""),
                 addr_reg=body.get("addr_reg", "r8"),
                 size_reg=body.get("size_reg", "r9"),
+                fixed_dumps=body.get("fixed_dumps"),
             )
 
         elif path == "/dbg_clear_trace_bp":
