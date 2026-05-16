@@ -62,6 +62,13 @@ def _run_on_main_thread(func, *args, **kwargs):
     We put work on a queue and a UI timer drains it on the main thread.
     The HTTP handler thread blocks on an Event until the result is ready.
     This never deadlocks because we never call execute_sync.
+
+    If the request stays queued for >5 s we log a warning to IDA's
+    Output window — the most common cause is a modal dialog blocking
+    IDA's main thread (e.g. "save changes? Y/N", a Hex-Rays warning,
+    or "type already exists, overwrite?"). idc.batch(1) wrapping in
+    _MainThreadTimer._tick suppresses most of these, but anything that
+    leaks through is now visible.
     """
     result = [None]
     error = [None]
@@ -71,8 +78,14 @@ def _run_on_main_thread(func, *args, **kwargs):
     with _request_lock:
         _request_queue.append(item)
 
-    # Wait for the main-thread timer to process our request
-    done.wait()
+    # Wait for the timer to process our request; surface a warning after 5s.
+    if not done.wait(timeout=5.0):
+        fn_name = getattr(func, "__name__", repr(func))
+        ida_kernwin.msg(
+            f"[MCP] WARNING: {fn_name} queued for >5s — "
+            f"check for a modal dialog blocking IDA's main thread.\n"
+        )
+        done.wait()  # block until the dialog is dismissed and the timer fires
 
     if error[0] is not None:
         raise error[0]
@@ -93,12 +106,26 @@ class _MainThreadTimer(object):
             batch = list(_request_queue)
             _request_queue.clear()
 
+        # Wrap every handler in idc.batch(1) so IDA suppresses modal dialogs
+        # for the duration of the call. Without this, a stray "type already
+        # exists, overwrite?" / "save Y/N?" popup blocks IDA's main thread,
+        # which blocks this timer, which wedges every queued request until
+        # the user notices and clicks the dialog. batch(1) makes IDA take
+        # the default action silently. Per-request scope: we restore the
+        # previous batch mode after each call so the user's interactive UI
+        # is unaffected.
         for func, args, kwargs, result, error, done in batch:
+            prev_batch = 0
             try:
+                prev_batch = idc.batch(1)
                 result[0] = func(*args, **kwargs)
             except Exception as e:
                 error[0] = e
             finally:
+                try:
+                    idc.batch(prev_batch)
+                except Exception:
+                    pass
                 done.set()
 
         return self._interval  # return interval to keep timer alive
