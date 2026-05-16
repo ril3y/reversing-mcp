@@ -360,7 +360,7 @@ def dbg_state(idb: str = "") -> dict:
     Args:
         idb: IDB filename substring to target (optional)
     """
-    return _call("/dbg_state", idb=idb or None)
+    return _call("/dbg_state", {}, idb=idb or None)
 
 
 @mcp.tool()
