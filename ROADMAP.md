@@ -7,6 +7,53 @@ self-contained chunk of work — pick whatever's highest leverage.
 Effort estimates assume working in-tree with the existing patterns:
 **S** = under 100 LOC, ~1 hour · **M** = 100–500 LOC, ~half a day · **L** = full feature, ~1+ days.
 
+## ★ Next-up top priority: Interactive markdown notebook (in-IDA GUI)
+
+A dockable IDA Pro view that renders the per-IDB scratch notebook as live
+markdown with bidirectional links to the IDB. Auto-updates as you make
+discoveries; embedded code blocks pick up renames automatically.
+
+### What makes it more than a viewer
+
+- **Live inline code** — markdown source like `{{decompile:0x1814C4AA0}}`
+  expands to the *current* Hex-Rays output at render time. Rename a local
+  variable in IDA → the embedded code block in the notebook re-renders to
+  show the new name. No copy/paste, no staleness.
+- **Clickable anchors** — auto-link `sub_XXXXXX` and `0x...` to `ida://...`
+  URLs; click dispatches to `ida_kernwin.jumpto(addr)`.
+- **Auto-refresh on IDB changes** — subscribed to `IDB_Hooks` (rename,
+  cmt_changed, func_added, func_deleted). Anything you do in the IDA UI
+  is reflected in the notebook within a render tick.
+- **Streaming append** — when MCP `scratch_log` writes a new section, the
+  view scrolls to it.
+
+### Layers
+
+| Layer | Mechanism |
+|---|---|
+| GUI form | `ida_kernwin.PluginForm` subclass + Qt `QTextBrowser` (HTML render, anchor clicks). Hotkey `Ctrl+Shift+N` to open. |
+| Markdown render | Python `markdown` + custom extensions for `{{decompile:...}}`, `{{disasm:...,n}}`, `{{xrefs:...}}`. Auto-link addresses + sub_XXXXXX. |
+| Click dispatch | `QTextBrowser.anchorClicked` → parse `ida://...` → `jumpto(ea)` / open Hex-Rays / trigger named action. |
+| Auto-refresh | `ida_idp.IDB_Hooks` subclass + `execute_sync` re-render scheduler. Also wired into `scratch_replace`. |
+
+### Endpoints to add
+
+- `scratch_show()` — open the viewer.
+- `scratch_refresh()` — force re-render.
+
+### What to steal
+
+- IDA SDK `ex_pluginform.py` for form scaffolding.
+- `lighthouse` (the IDA coverage plugin, MIT-licensed) for the
+  `PluginForm + Qt widget + IDB_Hooks` pattern — the cleanest open-source
+  example.
+- Python `markdown` + `mdx_gfm` extension for tables/strikethrough.
+
+### Effort
+
+**L** (~500–800 LOC over two focused sessions). Worth doing right rather
+than rushing.
+
 ## ✅ Shipped this session: IDA debugger integration
 
 22 new endpoints (`dbg_state`, `dbg_attach`/`launch`/`detach`/`terminate`,
