@@ -4,7 +4,40 @@ MCP servers that give Claude Code direct access to IDA Pro, Ghidra, jadx (Androi
 
 ## Install
 
-### 1. Clone + Python deps
+### Fast path — interactive installer (recommended)
+
+```bash
+git clone https://github.com/ril3y/reversing-mcp.git
+cd reversing-mcp
+python install.py
+```
+
+Walks you through a colored checkbox menu of which servers to install, picks
+`user` vs. `project` scope, and **runs all the build + deploy + register
+steps for you**:
+
+- IDA → copies `ida/plugin.py` into your IDA user plugins dir
+- Ghidra → `gradle build` (needs `GHIDRA_INSTALL_DIR`), then drops the ZIP in `~/.ghidra/.ghidra_<ver>/Extensions/`
+- jadx → `gradle shadowJar` (needs JDK 17+) → produces the fat JAR
+- ILSpy → `dotnet publish -c Release` (needs .NET 8 SDK) → produces the bridge binary
+- Unicorn → `pip install unicorn capstone`
+
+…then `claude mcp add` for each picked tool. Self-installs its own deps
+(`rich`, `questionary`) on first run, so the *only* prerequisite is a working
+`python` + `git` + `claude` CLI.
+
+Non-interactive / CI usage:
+
+```bash
+python install.py --all --scope user                  # everything available on this branch
+python install.py --tools ida,ghidra --scope user     # just two
+python install.py --tools ida --skip-builds           # skip jadx/ilspy/ghidra compile steps
+python install.py --tools ida --dry-run               # print what would happen, change nothing
+```
+
+### Manual install (if you don't want to run the installer)
+
+#### 1. Clone + Python deps
 
 ```bash
 git clone https://github.com/ril3y/reversing-mcp.git
@@ -12,7 +45,7 @@ cd reversing-mcp
 pip install mcp httpx
 ```
 
-### 2. Register the MCP servers with Claude Code
+#### 2. Register the MCP servers with Claude Code
 
 Pick the line that matches your shell. **Both lines use the four stable servers
 on `main`** — `unicorn` and `saleae_native` live on WIP branches (see
@@ -53,7 +86,7 @@ replaced by your absolute clone path:
 }
 ```
 
-### 3. Verify
+#### 3. Verify
 
 ```bash
 claude mcp list
@@ -68,7 +101,7 @@ packages, wrong Python, etc.) will print to stderr.
 > those tools (with the bridge installed per step 4) before you make calls,
 > or each tool will return `"No <Tool> instances found."`.
 
-### 4. Install the in-tool bridge
+#### 4. Install the in-tool bridge
 
 You need a bridge running inside each RE tool so the MCP server can talk to it.
 Install only the bridges for the tools you actually use.
@@ -147,7 +180,7 @@ The bridge writes `~/.unicorn_mcp/<pid>.json` with `{pid, port, arch}`. Target w
 
 Supported archs: `thumb`, `arm`, `arm64`, `x86`, `x86_64`, `mips`, `mipsel`, `mips64`, `riscv32`, `riscv64`.
 
-### 5. Use it
+### Use it
 
 Open a binary in Ghidra or IDA, then ask Claude Code to analyze it:
 
