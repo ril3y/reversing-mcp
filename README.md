@@ -1,6 +1,6 @@
 # reversing-mcp
 
-MCP servers that give Claude Code direct access to IDA Pro, Ghidra, jadx (Android/Java), ILSpy (.NET), and Unicorn Engine (emulator). Disassemble, decompile, rename, comment, search, navigate, and emulate without leaving your terminal.
+MCP servers that give Claude Code direct access to IDA Pro, Ghidra, jadx (Android/Java), ILSpy (.NET), Unicorn Engine (emulator), and Frida (dynamic instrumentation). Disassemble, decompile, rename, comment, search, navigate, emulate, and hook running processes without leaving your terminal.
 
 ## Install
 
@@ -21,6 +21,7 @@ steps for you**:
 - jadx → `gradle shadowJar` (needs JDK 17+) → produces the fat JAR
 - ILSpy → `dotnet publish -c Release` (needs .NET 8 SDK) → produces the bridge binary
 - Unicorn → `pip install unicorn capstone`
+- Frida → `pip install frida frida-tools` (no in-tool bridge needed; for Android/iOS you also push `frida-server` to the device — see `frida/README.md`)
 
 …then `claude mcp add` for each picked tool. Self-installs its own deps
 (`rich`, `questionary`) on first run, so the *only* prerequisite is a working
@@ -55,7 +56,7 @@ on `main`** — `unicorn` and `saleae_native` live on WIP branches (see
 
 ```bash
 REPO=$(pwd)
-for tool in ida ghidra jadx ilspy; do
+for tool in ida ghidra jadx ilspy frida; do
   claude mcp add -s user "$tool" -- python "$REPO/$tool/mcp_server.py"
 done
 ```
@@ -64,7 +65,7 @@ done
 
 ```powershell
 $repo = (Get-Location).Path
-foreach ($tool in 'ida','ghidra','jadx','ilspy') {
+foreach ($tool in 'ida','ghidra','jadx','ilspy','frida') {
   claude mcp add -s user $tool -- python "$repo/$tool/mcp_server.py"
 }
 ```
@@ -82,7 +83,8 @@ replaced by your absolute clone path:
   "ida":    { "command": "python", "args": ["/path/to/reversing-mcp/ida/mcp_server.py"] },
   "ghidra": { "command": "python", "args": ["/path/to/reversing-mcp/ghidra/mcp_server.py"] },
   "jadx":   { "command": "python", "args": ["/path/to/reversing-mcp/jadx/mcp_server.py"] },
-  "ilspy":  { "command": "python", "args": ["/path/to/reversing-mcp/ilspy/mcp_server.py"] }
+  "ilspy":  { "command": "python", "args": ["/path/to/reversing-mcp/ilspy/mcp_server.py"] },
+  "frida":  { "command": "python", "args": ["/path/to/reversing-mcp/frida/mcp_server.py"] }
 }
 ```
 
