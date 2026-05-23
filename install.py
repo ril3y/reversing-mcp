@@ -23,11 +23,15 @@ Re-runnable; reports what's already installed and offers to update/reinstall.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -102,6 +106,13 @@ class Context:
     scope: str       # "user" | "project"
     skip_builds: bool
     dry_run: bool
+    # When False (default), build_* tries the prebuilt release asset first
+    # and only falls back to a source build if the asset is missing or the
+    # network is unreachable.
+    from_source: bool = False
+    # Which release to pull prebuilts from. "latest" → /releases/latest;
+    # any other value is treated as a tag name like "v0.4.0".
+    release_tag: str = "latest"
 
 
 @dataclass
@@ -160,6 +171,56 @@ def _run(cmd: list[str], cwd: Path | None = None, dry: bool = False) -> int:
     return subprocess.call(cmd, cwd=str(cwd) if cwd else None)
 
 
+# --- Prebuilt-release fast path ---------------------------------------------
+#
+# CI publishes bridge artifacts on every tag push (see .github/workflows/
+# release.yml). If a matching asset is available, downloading it skips the
+# whole gradle / dotnet build step.
+
+RELEASES_REPO = "ril3y/reversing-mcp"
+PREBUILT_CACHE = Path.home() / ".cache" / "reversing-mcp"
+
+
+def _fetch_latest_release_assets(tag: str = "latest") -> list[tuple[str, str]]:
+    """Return [(asset_name, download_url), ...] for the requested release.
+
+    `tag="latest"` queries /releases/latest; any other value is treated as a
+    literal tag (`/releases/tags/<tag>`). Returns `[]` on any network or
+    parse failure — caller should fall back to source build.
+    """
+    path = "latest" if tag == "latest" else f"tags/{tag}"
+    url = f"https://api.github.com/repos/{RELEASES_REPO}/releases/{path}"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return []
+    return [(a["name"], a["browser_download_url"]) for a in data.get("assets", [])]
+
+
+def _download(url: str, dest: Path, dry: bool = False) -> bool:
+    if dry:
+        console.print(f"  [dim]would download:[/] {url} → {dest}")
+        return True
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with urllib.request.urlopen(url, timeout=60) as r, open(dest, "wb") as f:
+            shutil.copyfileobj(r, f)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        console.print(f"  [yellow]download failed:[/] {exc}")
+        return False
+    return True
+
+
+def _pick_asset(assets: list[tuple[str, str]], substr: str, suffix: str) -> tuple[str, str] | None:
+    """First asset whose name contains `substr` and ends with `suffix`."""
+    for name, url in assets:
+        if substr in name and name.endswith(suffix):
+            return name, url
+    return None
+
+
 # ---- IDA ----
 
 def build_ida(ctx: Context) -> Result:
@@ -186,16 +247,34 @@ def deploy_ida(ctx: Context) -> Result:
 def build_ghidra(ctx: Context) -> Result:
     if ctx.skip_builds:
         return Result(True, "(skipped per --skip-builds)")
+    bridge_dir = REPO_ROOT / "ghidra" / "ghidra-mcp-bridge"
+    dist = bridge_dir / "dist"
+
+    # Fast path: prebuilt release asset.
+    if not ctx.from_source:
+        assets = _fetch_latest_release_assets(ctx.release_tag)
+        pick = _pick_asset(assets, "ghidra-mcp-bridge", ".zip")
+        if pick:
+            name, url = pick
+            dst = dist / name
+            console.print(f"  [dim]prebuilt:[/] {name} from {ctx.release_tag}")
+            if _download(url, dst, dry=ctx.dry_run):
+                return Result(True, f"downloaded {name}",
+                              note="No Ghidra install or JDK needed for this path.")
+            console.print("  [yellow]falling back to source build[/]")
+
+    # Source build needs Ghidra to compile against.
     ghidra_dir = os.environ.get("GHIDRA_INSTALL_DIR")
     if not ghidra_dir:
         return Result(
             False, "GHIDRA_INSTALL_DIR not set",
-            note="Set it to your Ghidra install root (e.g. C:\\ghidra_11.0.1_PUBLIC) and re-run, "
-                 "or skip ghidra and install the extension manually.",
+            note="Either point GHIDRA_INSTALL_DIR at your Ghidra install root "
+                 "(e.g. C:\\ghidra_11.0.1_PUBLIC) for a source build, OR omit "
+                 "--from-source so the installer downloads the prebuilt release "
+                 "asset (none was found just now — first release pending?).",
         )
-    bridge_dir = REPO_ROOT / "ghidra" / "ghidra-mcp-bridge"
     gradlew = bridge_dir / ("gradlew.bat" if platform.system() == "Windows" else "gradlew")
-    cmd = [str(gradlew)] if gradlew.exists() else ["gradle"]
+    cmd = [str(gradlew), "--no-daemon"] if gradlew.exists() else ["gradle"]
     rc = _run(cmd, cwd=bridge_dir, dry=ctx.dry_run)
     if rc != 0:
         return Result(False, f"gradle build exited {rc}")
@@ -231,10 +310,30 @@ def build_jadx(ctx: Context) -> Result:
     bridge_dir = REPO_ROOT / "jadx" / "jadx-mcp-bridge"
     if not bridge_dir.is_dir():
         return Result(False, "jadx/jadx-mcp-bridge missing — branch checkout issue?")
-    if shutil.which("gradle") is None:
-        return Result(False, "gradle not on PATH",
-                      note="Install Gradle (or use SDKMAN / chocolatey: `choco install gradle`).")
-    rc = _run(["gradle", "shadowJar"], cwd=bridge_dir, dry=ctx.dry_run)
+
+    # Fast path: prebuilt fat JAR.
+    if not ctx.from_source:
+        assets = _fetch_latest_release_assets(ctx.release_tag)
+        pick = _pick_asset(assets, "jadx-mcp-bridge", "-all.jar")
+        if pick:
+            name, url = pick
+            dst = bridge_dir / "build" / "libs" / name
+            console.print(f"  [dim]prebuilt:[/] {name} from {ctx.release_tag}")
+            if _download(url, dst, dry=ctx.dry_run):
+                return Result(True, f"downloaded {name}",
+                              note="No JDK needed for this path.")
+            console.print("  [yellow]falling back to source build[/]")
+
+    # Source build via wrapper (preferred) or system gradle.
+    gradlew = bridge_dir / ("gradlew.bat" if platform.system() == "Windows" else "gradlew")
+    if gradlew.exists():
+        cmd = [str(gradlew), "--no-daemon", "shadowJar"]
+    elif shutil.which("gradle") is not None:
+        cmd = ["gradle", "shadowJar"]
+    else:
+        return Result(False, "no gradle wrapper and no system gradle",
+                      note="Update from upstream (vendored wrapper) or install gradle.")
+    rc = _run(cmd, cwd=bridge_dir, dry=ctx.dry_run)
     if rc != 0:
         return Result(False, f"gradle shadowJar exited {rc}")
     return Result(True, "fat JAR built at jadx/jadx-mcp-bridge/build/libs/jadx-mcp-bridge.jar")
@@ -253,6 +352,27 @@ def build_ilspy(ctx: Context) -> Result:
     proj_dir = REPO_ROOT / "ilspy" / "IlspyMcpBridge"
     if not proj_dir.is_dir():
         return Result(False, "ilspy/IlspyMcpBridge missing")
+
+    # Fast path: prebuilt zip — extract into the publish dir so launching
+    # the bridge resolves DLLs the same way as a from-source publish.
+    if not ctx.from_source:
+        assets = _fetch_latest_release_assets(ctx.release_tag)
+        pick = _pick_asset(assets, "ilspy-mcp-bridge", ".zip")
+        if pick:
+            name, url = pick
+            cache_zip = PREBUILT_CACHE / name
+            console.print(f"  [dim]prebuilt:[/] {name} from {ctx.release_tag}")
+            if _download(url, cache_zip, dry=ctx.dry_run):
+                publish = proj_dir / "bin" / "Release" / "net8.0" / "publish"
+                if not ctx.dry_run:
+                    publish.mkdir(parents=True, exist_ok=True)
+                    with zipfile.ZipFile(cache_zip) as z:
+                        z.extractall(publish)
+                return Result(True, f"unpacked {name} → {publish}",
+                              note="No .NET SDK needed for this path. "
+                                   "Launch with `dotnet <publish>/IlspyMcpBridge.dll <asm>`.")
+            console.print("  [yellow]falling back to source build[/]")
+
     if shutil.which("dotnet") is None:
         return Result(False, "dotnet not on PATH",
                       note="Install the .NET 8 SDK from https://dotnet.microsoft.com/download")
@@ -433,6 +553,11 @@ def main() -> int:
                     help="install scope (default: ask)")
     ap.add_argument("--skip-builds", action="store_true",
                     help="register MCP servers and copy plugins, but don't compile jadx/ilspy/ghidra")
+    ap.add_argument("--from-source", action="store_true",
+                    help="skip the prebuilt-release fast path; always compile from source "
+                         "(default: try prebuilt first, fall back to source on failure)")
+    ap.add_argument("--release-tag", default="latest",
+                    help="which release to pull prebuilt assets from (default: latest)")
     ap.add_argument("--dry-run", action="store_true",
                     help="show what would run without doing anything")
     args = ap.parse_args()
@@ -468,7 +593,13 @@ def main() -> int:
 
     scope = args.scope or pick_scope()
 
-    ctx = Context(scope=scope, skip_builds=args.skip_builds, dry_run=args.dry_run)
+    ctx = Context(
+        scope=scope,
+        skip_builds=args.skip_builds,
+        dry_run=args.dry_run,
+        from_source=args.from_source,
+        release_tag=args.release_tag,
+    )
     return 0 if run_install(selected, ctx) == 0 else 1
 
 

@@ -11,6 +11,9 @@ dist/
 build/
 *.class
 *.jar
+# … except the vendored gradle wrapper, which is needed for `./gradlew` to
+# bootstrap on any platform without a pre-installed gradle.
+!**/gradle/wrapper/gradle-wrapper.jar
 
 # .NET build artifacts
 bin/
