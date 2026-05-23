@@ -14,13 +14,19 @@ python install.py
 
 Walks you through a colored checkbox menu of which servers to install, picks
 `user` vs. `project` scope, and **runs all the build + deploy + register
-steps for you**:
+steps for you**.
 
-- IDA → copies `ida/plugin.py` into your IDA user plugins dir
-- Ghidra → `gradle build` (needs `GHIDRA_INSTALL_DIR`), then drops the ZIP in `~/.ghidra/.ghidra_<ver>/Extensions/`
-- jadx → `gradle shadowJar` (needs JDK 17+) → produces the fat JAR
-- ILSpy → `dotnet publish -c Release` (needs .NET 8 SDK) → produces the bridge binary
-- Unicorn → `pip install unicorn capstone`
+By default, the installer **pulls prebuilt bridge artifacts from the latest
+GitHub release** so you don't need a JDK / .NET SDK / Ghidra install just to
+get going:
+
+| Tool   | Default path (no toolchain needed) | Fallback if download fails |
+|--------|-------------------------------------|----------------------------|
+| IDA    | Copies `ida/plugin.py` into your IDA user plugins dir | n/a — no build step |
+| Ghidra | Downloads `ghidra-mcp-bridge.zip` from latest release → `~/.ghidra/.ghidra_<ver>/Extensions/` | `gradle build` against your `GHIDRA_INSTALL_DIR` (needs JDK 21) |
+| jadx   | Downloads `jadx-mcp-bridge-all.jar` from latest release | `./gradlew shadowJar` (needs JDK 17+) |
+| ILSpy  | Downloads `ilspy-mcp-bridge.zip` and unpacks it | `dotnet publish -c Release` (needs .NET 8 SDK) |
+| Unicorn| `pip install unicorn capstone`     | n/a — pip is the build |
 
 …then `claude mcp add` for each picked tool. Self-installs its own deps
 (`rich`, `questionary`) on first run, so the *only* prerequisite is a working
@@ -31,9 +37,16 @@ Non-interactive / CI usage:
 ```bash
 python install.py --all --scope user                  # everything available on this branch
 python install.py --tools ida,ghidra --scope user     # just two
-python install.py --tools ida --skip-builds           # skip jadx/ilspy/ghidra compile steps
+python install.py --tools ida --skip-builds           # skip the bridge build step entirely
 python install.py --tools ida --dry-run               # print what would happen, change nothing
+python install.py --tools ghidra --from-source        # force source build, skip prebuilt
+python install.py --tools ghidra --release-tag v0.5.0 # pin to a specific release
 ```
+
+> Prebuilt artifacts are published by `.github/workflows/release.yml` on every
+> `v*` tag — see the [Releases page](https://github.com/ril3y/reversing-mcp/releases).
+> Source builds remain the source of truth and are always exercised in CI on
+> every PR.
 
 ### Manual install (if you don't want to run the installer)
 
@@ -110,13 +123,23 @@ Install only the bridges for the tools you actually use.
 
 The extension auto-starts the bridge when you open a program. No manual script launching needed.
 
+**Easiest path — download the prebuilt ZIP** from the latest
+[release](https://github.com/ril3y/reversing-mcp/releases). Drop it in
+`~/.ghidra/.ghidra_<version>/Extensions/` (Windows: `%APPDATA%\ghidra\.ghidra_<version>\Extensions\`).
+
+**Or build from source** (requires JDK 21 + an unpacked Ghidra install):
+
 ```bash
 cd ghidra/ghidra-mcp-bridge
-export GHIDRA_INSTALL_DIR=/path/to/ghidra
-./gradlew
+export GHIDRA_INSTALL_DIR=/path/to/ghidra    # Windows: $env:GHIDRA_INSTALL_DIR = "C:\path\to\ghidra"
+./gradlew                                    # Windows: .\gradlew.bat
 ```
 
-Then in Ghidra: **File > Install Extensions > +** and select the ZIP from `ghidra/ghidra-mcp-bridge/dist/`. Restart Ghidra.
+(The `gradlew` wrapper is vendored — you don't need a system `gradle` install.)
+
+Then in Ghidra: **File > Install Extensions > +**, pick the ZIP from
+`ghidra/ghidra-mcp-bridge/dist/`, restart Ghidra, and open a program.
+`mcp__ghidra__list_instances` should now show it.
 
 #### Ghidra (Script — alternative)
 
@@ -144,12 +167,12 @@ when the bridge is up. Verify from a shell with `python ida/mcp_server.py --list
 
 #### jadx (standalone Java bridge)
 
-Unlike Ghidra/IDA, jadx has no resident GUI to host the bridge — it's a separate JVM process per APK/JAR. Build the fat JAR once, then launch one per target:
+Unlike Ghidra/IDA, jadx has no resident GUI to host the bridge — it's a separate JVM process per APK/JAR. Either grab the prebuilt fat JAR from the latest [release](https://github.com/ril3y/reversing-mcp/releases) or build it once:
 
 ```bash
 cd jadx/jadx-mcp-bridge
-gradle shadowJar                           # JDK 17+ required
-java -jar build/libs/jadx-mcp-bridge.jar /path/to/app.apk
+./gradlew shadowJar                        # Windows: .\gradlew.bat shadowJar  (JDK 17+ required)
+java -jar build/libs/jadx-mcp-bridge-all.jar /path/to/app.apk
 ```
 
 The bridge writes `~/.jadx_mcp/<pid>.json` and the MCP server picks it up. Run multiple bridges for multiple APKs; target one from Claude with `jar="app.apk"`.

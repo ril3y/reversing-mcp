@@ -1,0 +1,178 @@
+name: Build bridges
+
+# Build the per-tool bridge artifacts on every push and PR (so we know the
+# build still works), and additionally publish them as GitHub release assets
+# on tag pushes (`v*`) and manual dispatch with a tag input.
+#
+# The point of this workflow is to spare end-users the toolchain hassle:
+# - Ghidra extension ZIP needs JDK 21 + a Ghidra install just to build
+# - jadx fat JAR needs JDK 17
+# - ILSpy bridge needs the .NET 8 SDK
+#
+# install.py prefers prebuilt assets from the latest release; it falls back
+# to a source build only when the asset for the current branch / version is
+# missing.
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "If set, attach artifacts to a GitHub release with this tag (e.g. v0.4.0)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write       # softprops/action-gh-release needs this to upload assets
+
+env:
+  # Pinned for reproducibility. Update both fields together when bumping.
+  GHIDRA_VERSION: "11.0.1_PUBLIC"
+  GHIDRA_BUILD_DATE: "20240130"
+
+jobs:
+  # ----- Ghidra extension ZIP --------------------------------------------
+  ghidra:
+    name: Ghidra extension (${{ matrix.os }})
+    # Build is OS-agnostic (gradle + JDK), so one runner is enough.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache Ghidra install
+        id: cache-ghidra
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ghidra
+          key: ghidra-${{ env.GHIDRA_VERSION }}-${{ env.GHIDRA_BUILD_DATE }}
+
+      - name: Download Ghidra
+        if: steps.cache-ghidra.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/ghidra"
+          curl -fsSL -o "$RUNNER_TEMP/ghidra.zip" \
+            "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION%_PUBLIC}_build/ghidra_${GHIDRA_VERSION}_${GHIDRA_BUILD_DATE}.zip"
+          unzip -q "$RUNNER_TEMP/ghidra.zip" -d "$RUNNER_TEMP/ghidra"
+
+      - name: Export GHIDRA_INSTALL_DIR
+        shell: bash
+        run: |
+          # The unzip puts everything under ghidra_<ver>_PUBLIC/
+          install_dir=$(find "$RUNNER_TEMP/ghidra" -maxdepth 2 -type d -name "ghidra_${GHIDRA_VERSION}" | head -1)
+          test -d "$install_dir/Ghidra" || { echo "no Ghidra/ found under $install_dir"; ls -la "$RUNNER_TEMP/ghidra"; exit 1; }
+          echo "GHIDRA_INSTALL_DIR=$install_dir" >> "$GITHUB_ENV"
+
+      - name: Build extension ZIP
+        working-directory: ghidra/ghidra-mcp-bridge
+        run: ./gradlew --no-daemon
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghidra-mcp-bridge
+          path: ghidra/ghidra-mcp-bridge/dist/*.zip
+          if-no-files-found: error
+
+  # ----- jadx fat JAR ----------------------------------------------------
+  jadx:
+    name: jadx bridge JAR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build fat JAR
+        working-directory: jadx/jadx-mcp-bridge
+        run: ./gradlew --no-daemon shadowJar
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jadx-mcp-bridge
+          path: jadx/jadx-mcp-bridge/build/libs/*-all.jar
+          if-no-files-found: error
+
+  # ----- ILSpy bridge ----------------------------------------------------
+  ilspy:
+    name: ILSpy bridge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish (framework-dependent, cross-platform)
+        working-directory: ilspy/IlspyMcpBridge
+        run: dotnet publish -c Release --nologo -o publish
+
+      - name: Bundle into a zip
+        working-directory: ilspy/IlspyMcpBridge
+        run: |
+          # Stable name regardless of project version; install.py looks for
+          # ilspy-mcp-bridge-<os>.zip or just the .dll inside.
+          (cd publish && zip -r ../ilspy-mcp-bridge.zip .)
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ilspy-mcp-bridge
+          path: ilspy/IlspyMcpBridge/ilspy-mcp-bridge.zip
+          if-no-files-found: error
+
+  # ----- Aggregated release ----------------------------------------------
+  release:
+    # Only attach assets to a release when:
+    #   (a) we're on a v* tag push, OR
+    #   (b) the user dispatched manually with a `tag` input.
+    needs: [ghidra, jadx, ilspy]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifact dir
+        run: |
+          set -eux
+          mkdir release
+          find artifacts -type f \( -name '*.zip' -o -name '*-all.jar' \) -exec cp {} release/ \;
+          ls -la release
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: release/*
+          generate_release_notes: true
