@@ -35,6 +35,11 @@ ENDPOINT_TIMEOUTS = {
     "/set_segment_perms": 30,
     "/search_functions": 60,
     "/search_strings": 60,
+    "/xrefs_to": 60,
+    "/xrefs_from": 60,
+    "/callers": 60,
+    "/callees": 120,    # iterates instructions, can be slow on large functions
+    "/bytes": 15,
 }
 
 

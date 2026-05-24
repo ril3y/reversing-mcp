@@ -171,6 +171,13 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             server.createContext("/comment", wrap(this::handleComment));
             server.createContext("/set_segment_perms", wrap(this::handleSetSegmentPerms));
             server.createContext("/analyze_range", wrap(this::handleAnalyzeRange));
+            server.createContext("/search_strings", wrap(this::handleSearchStrings));
+            server.createContext("/xrefs_to", wrap(this::handleXrefsTo));
+            server.createContext("/xrefs_from", wrap(this::handleXrefsFrom));
+            server.createContext("/callers", wrap(this::handleCallers));
+            server.createContext("/callees", wrap(this::handleCallees));
+            server.createContext("/bytes", wrap(this::handleBytes));
+            server.createContext("/create_function", wrap(this::handleCreateFunction));
 
             server.start();
 
@@ -984,6 +991,308 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             sb.append(jp("start", formatAddr(start))).append(", ");
             sb.append(jp("end", formatAddr(end))).append(", ");
             sb.append(jp("bytes", byteCount));
+            sb.append("}");
+            return sb.toString();
+        });
+        respond(ex, json);
+    }
+
+    // POST /search_strings -----------------------------------------------
+    // Body: {"pattern": "<substring>"}  (case-insensitive, max 100)
+
+    private void handleSearchStrings(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String pattern = body.get("pattern");
+        if (pattern == null) {
+            respondError(ex, "Provide 'pattern'", 400);
+            return;
+        }
+        String json = onSwing(() -> {
+            String patternLower = pattern.toLowerCase();
+            List<String> results = new ArrayList<>();
+            int count = 0;
+            DataIterator dataIter = activeProgram.getListing().getDefinedData(true);
+            while (dataIter.hasNext() && count < 100) {
+                Data data = dataIter.next();
+                if (!data.hasStringValue()) continue;
+                String value = data.getDefaultValueRepresentation();
+                if (value == null) continue;
+                if (value.startsWith("\"") && value.endsWith("\"")) {
+                    value = value.substring(1, value.length() - 1);
+                }
+                if (!value.toLowerCase().contains(patternLower)) continue;
+                StringBuilder entry = new StringBuilder();
+                entry.append("{");
+                entry.append(jp("address", formatAddr(data.getAddress()))).append(", ");
+                entry.append(jp("value", value)).append(", ");
+                entry.append(jp("length", data.getLength()));
+                entry.append("}");
+                results.add(entry.toString());
+                count++;
+            }
+            return "{\"strings\": [" + String.join(", ", results) + "]}";
+        });
+        respond(ex, json);
+    }
+
+    // POST /xrefs_to -----------------------------------------------------
+    // Body: {"address": "<hex>"} OR {"name": "<func name>"}
+
+    private void handleXrefsTo(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String json = onSwing(() -> {
+            Address addr = null;
+            String addrStr = body.get("address");
+            String name = body.get("name");
+            if (addrStr != null && !addrStr.isEmpty()) {
+                addr = parseAddress(addrStr);
+            } else if (name != null && !name.isEmpty()) {
+                Function func = findFunctionByName(name);
+                if (func != null) addr = func.getEntryPoint();
+            }
+            if (addr == null) {
+                return "{" + jp("error", "Provide valid 'address' or 'name'") + "}";
+            }
+            ghidra.program.model.symbol.ReferenceIterator refsIter =
+                activeProgram.getReferenceManager().getReferencesTo(addr);
+            List<String> entries = new ArrayList<>();
+            while (refsIter.hasNext()) {
+                Reference ref = refsIter.next();
+                Function fromFunc = activeProgram.getListing()
+                    .getFunctionContaining(ref.getFromAddress());
+                String fromFuncName = fromFunc != null ? fromFunc.getName() : "";
+                StringBuilder entry = new StringBuilder();
+                entry.append("{");
+                entry.append(jp("from", formatAddr(ref.getFromAddress()))).append(", ");
+                entry.append(jp("from_func", fromFuncName)).append(", ");
+                entry.append(jp("type", ref.getReferenceType().getValue())).append(", ");
+                entry.append(jp("type_name", ref.getReferenceType().getName()));
+                entry.append("}");
+                entries.add(entry.toString());
+            }
+            return "{\"refs\": [" + String.join(", ", entries) + "]}";
+        });
+        respond(ex, json);
+    }
+
+    // POST /xrefs_from ---------------------------------------------------
+
+    private void handleXrefsFrom(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String addrStr = body.get("address");
+        if (addrStr == null || addrStr.isEmpty()) {
+            respondError(ex, "Provide 'address'", 400);
+            return;
+        }
+        String json = onSwing(() -> {
+            Address addr = parseAddress(addrStr);
+            if (addr == null) {
+                return "{" + jp("error", "Invalid address") + "}";
+            }
+            Reference[] refs = activeProgram.getReferenceManager().getReferencesFrom(addr);
+            List<String> entries = new ArrayList<>();
+            for (Reference ref : refs) {
+                Address toAddr = ref.getToAddress();
+                Symbol sym = activeProgram.getSymbolTable().getPrimarySymbol(toAddr);
+                String symName = sym != null ? sym.getName() : "";
+                StringBuilder entry = new StringBuilder();
+                entry.append("{");
+                entry.append(jp("to", formatAddr(toAddr))).append(", ");
+                entry.append(jp("name", symName)).append(", ");
+                entry.append(jp("type", ref.getReferenceType().getValue())).append(", ");
+                entry.append(jp("type_name", ref.getReferenceType().getName()));
+                entry.append("}");
+                entries.add(entry.toString());
+            }
+            return "{\"refs\": [" + String.join(", ", entries) + "]}";
+        });
+        respond(ex, json);
+    }
+
+    // POST /callers ------------------------------------------------------
+    // Body: {"address": "<hex>"} OR {"name": "<func name>"}
+    // Returns unique functions that call the target.
+
+    private void handleCallers(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String json = onSwing(() -> {
+            Function func = resolveFunction(body);
+            if (func == null) {
+                return "{" + jp("error", "Function not found") + "}";
+            }
+            Set<String> seen = new LinkedHashSet<>();
+            List<String> entries = new ArrayList<>();
+            ghidra.program.model.symbol.ReferenceIterator refsIter =
+                activeProgram.getReferenceManager()
+                    .getReferencesTo(func.getEntryPoint());
+            while (refsIter.hasNext()) {
+                Reference ref = refsIter.next();
+                if (!ref.getReferenceType().isCall() &&
+                    !ref.getReferenceType().isJump()) continue;
+                Function caller = activeProgram.getListing()
+                    .getFunctionContaining(ref.getFromAddress());
+                if (caller == null) continue;
+                if (caller.getEntryPoint().equals(func.getEntryPoint())) continue;
+                String key = formatAddr(caller.getEntryPoint());
+                if (!seen.add(key)) continue;
+                StringBuilder entry = new StringBuilder();
+                entry.append("{");
+                entry.append(jp("address", key)).append(", ");
+                entry.append(jp("name", caller.getName())).append(", ");
+                entry.append(jp("call_site", formatAddr(ref.getFromAddress())));
+                entry.append("}");
+                entries.add(entry.toString());
+            }
+            return "{\"callers\": [" + String.join(", ", entries) + "]}";
+        });
+        respond(ex, json);
+    }
+
+    // POST /callees ------------------------------------------------------
+
+    private void handleCallees(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String json = onSwing(() -> {
+            Function func = resolveFunction(body);
+            if (func == null) {
+                return "{" + jp("error", "Function not found") + "}";
+            }
+            Set<String> seen = new LinkedHashSet<>();
+            List<String> entries = new ArrayList<>();
+            Listing listing = activeProgram.getListing();
+            InstructionIterator instructions =
+                listing.getInstructions(func.getBody(), true);
+            while (instructions.hasNext()) {
+                Instruction instr = instructions.next();
+                Reference[] refs = activeProgram.getReferenceManager()
+                    .getReferencesFrom(instr.getAddress());
+                for (Reference ref : refs) {
+                    if (!ref.getReferenceType().isCall() &&
+                        !ref.getReferenceType().isJump()) continue;
+                    Function target = listing.getFunctionAt(ref.getToAddress());
+                    if (target == null) {
+                        target = listing.getFunctionContaining(ref.getToAddress());
+                    }
+                    if (target == null) continue;
+                    if (target.getEntryPoint().equals(func.getEntryPoint())) continue;
+                    String key = formatAddr(target.getEntryPoint());
+                    if (!seen.add(key)) continue;
+                    StringBuilder entry = new StringBuilder();
+                    entry.append("{");
+                    entry.append(jp("address", key)).append(", ");
+                    entry.append(jp("name", target.getName()));
+                    entry.append("}");
+                    entries.add(entry.toString());
+                }
+            }
+            return "{\"callees\": [" + String.join(", ", entries) + "]}";
+        });
+        respond(ex, json);
+    }
+
+    // POST /bytes --------------------------------------------------------
+    // Body: {"address": "<hex>", "size": <int, max 4096>}
+
+    private void handleBytes(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String addrStr = body.get("address");
+        String sizeStr = body.get("size");
+        if (addrStr == null || addrStr.isEmpty()) {
+            respondError(ex, "Provide 'address'", 400);
+            return;
+        }
+        int requested = 256;
+        if (sizeStr != null && !sizeStr.isEmpty()) {
+            try { requested = Integer.parseInt(sizeStr); }
+            catch (NumberFormatException ignored) {}
+        }
+        final int sz = Math.min(Math.max(requested, 1), 4096);
+        String json = onSwing(() -> {
+            Address addr = parseAddress(addrStr);
+            if (addr == null) {
+                return "{" + jp("error", "Invalid address") + "}";
+            }
+            byte[] buf = new byte[sz];
+            int read;
+            try {
+                read = activeProgram.getMemory().getBytes(addr, buf);
+            } catch (Exception e) {
+                return "{" + jp("error",
+                    "Cannot read bytes at address: " + e.getMessage()) + "}";
+            }
+            byte[] actual = buf;
+            if (read < sz) {
+                actual = new byte[read];
+                System.arraycopy(buf, 0, actual, 0, read);
+            }
+            StringBuilder hex = new StringBuilder();
+            for (byte b : actual) hex.append(String.format("%02x", b & 0xFF));
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            sb.append(jp("address", formatAddr(addr))).append(", ");
+            sb.append(jp("size", actual.length)).append(", ");
+            sb.append(jp("hex", hex.toString()));
+            sb.append("}");
+            return sb.toString();
+        });
+        respond(ex, json);
+    }
+
+    // POST /create_function ----------------------------------------------
+    // Body: {"address": "<hex>", "end": "<hex>"?}
+    // Forces Ghidra to define a function at the given address. Useful for
+    // regions where auto-analysis missed the boundary.
+
+    private void handleCreateFunction(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String addrStr = body.get("address");
+        String endStr = body.get("end");
+        if (addrStr == null || addrStr.isEmpty()) {
+            respondError(ex, "Provide 'address'", 400);
+            return;
+        }
+        String json = onSwing(() -> {
+            Address addr = parseAddress(addrStr);
+            if (addr == null) {
+                return "{" + jp("success", false) + ", " +
+                       jp("error", "Invalid address") + "}";
+            }
+            Address end = (endStr != null && !endStr.isEmpty())
+                ? parseAddress(endStr) : null;
+            boolean success = false;
+            Function func = null;
+            int txId = activeProgram.startTransaction("MCP Create Function");
+            try {
+                if (end != null) {
+                    AddressSet bodySet = new AddressSet(addr, end);
+                    func = activeProgram.getListing().createFunction(
+                        null, addr, bodySet,
+                        ghidra.program.model.symbol.SourceType.USER_DEFINED);
+                } else {
+                    ghidra.app.cmd.function.CreateFunctionCmd cmd =
+                        new ghidra.app.cmd.function.CreateFunctionCmd(addr);
+                    cmd.applyTo(activeProgram, TaskMonitor.DUMMY);
+                    func = activeProgram.getListing().getFunctionAt(addr);
+                }
+                success = (func != null);
+            } catch (Exception e) {
+                Msg.error(this, "[MCP] CREATE FUNC FAILED " + formatAddr(addr), e);
+            } finally {
+                activeProgram.endTransaction(txId, success);
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            sb.append(jp("success", success)).append(", ");
+            sb.append(jp("address", formatAddr(addr)));
+            if (func != null) {
+                sb.append(", ");
+                sb.append(jp("name", func.getName())).append(", ");
+                sb.append(jp("size", func.getBody().getNumAddresses()));
+            }
+            if (!success) {
+                sb.append(", ");
+                sb.append(jp("error", "create_function failed"));
+            }
             sb.append("}");
             return sb.toString();
         });
