@@ -178,6 +178,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             server.createContext("/callees", wrap(this::handleCallees));
             server.createContext("/bytes", wrap(this::handleBytes));
             server.createContext("/create_function", wrap(this::handleCreateFunction));
+            server.createContext("/exec_script", wrap(this::handleExecScript));
 
             server.start();
 
@@ -1292,6 +1293,105 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             if (!success) {
                 sb.append(", ");
                 sb.append(jp("error", "create_function failed"));
+            }
+            sb.append("}");
+            return sb.toString();
+        });
+        respond(ex, json);
+    }
+
+    // POST /exec_script ---------------------------------------------------
+    // Body: {"code": "<jython source>", "commit": "true|false"}
+    //
+    // Executes user-supplied Jython 2.7 code against the currently-loaded
+    // program.  Globals pre-populated:
+    //     currentProgram = the active Program
+    //     monitor        = TaskMonitor.DUMMY
+    //     fpapi          = FlatProgramAPI(currentProgram)
+    // and these modules are wildcard-imported:
+    //     ghidra.program.flatapi
+    //     ghidra.program.model.address / .listing / .symbol / .mem / .scalar
+    //     ghidra.util.task (TaskMonitor)
+    //
+    // print() output is captured and returned in the "stdout" field.
+    // If commit=true (default), the script runs inside a database
+    // transaction so it may safely call rename/addComment/etc.  Set
+    // commit=false for read-only analysis scripts (faster, can't dirty
+    // the DB on a script bug).
+    //
+    // Use this when the dedicated endpoints aren't expressive enough --
+    // bulk vtable resolution, custom xref hunts, struct field mapping,
+    // mass-decoration scans, etc.
+
+    private void handleExecScript(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String code = body.get("code");
+        if (code == null || code.isEmpty()) {
+            respondError(ex, "Provide 'code'", 400);
+            return;
+        }
+        boolean commit = !"false".equalsIgnoreCase(body.get("commit"));
+        String json = onSwing(() -> {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            PrintStream ps;
+            try {
+                ps = new PrintStream(baos, true, "UTF-8");
+            } catch (UnsupportedEncodingException u) {
+                ps = new PrintStream(baos, true);
+            }
+            String error = null;
+            boolean success = false;
+            int txId = -1;
+            if (commit) {
+                txId = activeProgram.startTransaction("MCP Exec Script");
+            }
+            try {
+                org.python.util.PythonInterpreter interp =
+                    new org.python.util.PythonInterpreter();
+                try {
+                    interp.setOut(ps);
+                    interp.setErr(ps);
+                    interp.set("currentProgram", activeProgram);
+                    interp.set("monitor", TaskMonitor.DUMMY);
+                    interp.exec(
+                        "from ghidra.program.flatapi import FlatProgramAPI\n" +
+                        "from ghidra.program.model.address import *\n" +
+                        "from ghidra.program.model.listing import *\n" +
+                        "from ghidra.program.model.symbol import *\n" +
+                        "from ghidra.program.model.mem import *\n" +
+                        "from ghidra.program.model.scalar import *\n" +
+                        "from ghidra.util.task import TaskMonitor\n" +
+                        "fpapi = FlatProgramAPI(currentProgram)\n");
+                    interp.exec(code);
+                    ps.flush();
+                    success = true;
+                } finally {
+                    try { interp.close(); } catch (Throwable ignored) {}
+                }
+            } catch (Throwable t) {
+                ps.flush();
+                String msg = t.getMessage();
+                error = t.getClass().getSimpleName() + ": " +
+                        (msg != null ? msg : "(no message)");
+                Msg.error(this, "[MCP] EXEC SCRIPT FAILED", t);
+            } finally {
+                if (commit) {
+                    activeProgram.endTransaction(txId, success);
+                }
+            }
+            String stdout;
+            try {
+                stdout = baos.toString("UTF-8");
+            } catch (UnsupportedEncodingException u) {
+                stdout = baos.toString();
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            sb.append(jp("success", success)).append(", ");
+            sb.append(jp("committed", commit)).append(", ");
+            sb.append(jp("stdout", stdout));
+            if (error != null) {
+                sb.append(", ").append(jp("error", error));
             }
             sb.append("}");
             return sb.toString();

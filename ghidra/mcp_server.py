@@ -40,6 +40,7 @@ ENDPOINT_TIMEOUTS = {
     "/callers": 60,
     "/callees": 120,    # iterates instructions, can be slow on large functions
     "/bytes": 15,
+    "/exec_script": 600,  # arbitrary Jython; can be long
 }
 
 
@@ -299,6 +300,42 @@ def analyze_range(start: str, end: str, program: str = "") -> dict:
     """
     return _call("/analyze_range",
                  {"start": start, "end": end},
+                 program=program or None)
+
+
+@mcp.tool()
+def exec_script(code: str, commit: bool = True, program: str = "") -> dict:
+    """Execute arbitrary Jython 2.7 code against the loaded program with full
+    Ghidra API access. Returns a dict with `success`, `stdout` (captured print
+    output), `committed` (whether wrapped in a DB transaction), and optionally
+    `error`.
+
+    Pre-populated globals in the script context:
+        currentProgram  -- the active Program instance
+        monitor         -- TaskMonitor.DUMMY
+        fpapi           -- FlatProgramAPI(currentProgram)
+    And wildcard-imported:
+        ghidra.program.flatapi
+        ghidra.program.model.address / .listing / .symbol / .mem / .scalar
+        ghidra.util.task (TaskMonitor)
+
+    Use this when the dedicated endpoints aren't expressive enough -- bulk
+    vtable-call resolution, custom xref hunts, struct field mapping, mass
+    rename/comment scans, anything that benefits from raw Ghidra API access.
+
+    Use `commit=False` for read-only analysis scripts (faster, can't dirty
+    the DB on a script bug). Use `commit=True` (default) when the script
+    needs to mutate the program (rename, addComment, createFunction, etc).
+
+    Args:
+        code: Jython source. Use `print()` for output. The script runs to
+            completion (or hits the 10-minute server-side timeout).
+        commit: If True (default), wrap execution in a Ghidra DB transaction.
+            If False, no transaction is opened (read-only mode).
+        program: Program name substring to target (optional).
+    """
+    return _call("/exec_script",
+                 {"code": code, "commit": "true" if commit else "false"},
                  program=program or None)
 
 
