@@ -70,7 +70,24 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     private ExecutorService serverExecutor;
     private int serverPort;
     private DecompInterface decompiler;
+    private Program lastDecompiledProgram;
     private Program activeProgram;
+    /** All programs currently opened in this tool, keyed by program name. */
+    private final java.util.concurrent.ConcurrentHashMap<String, Program> openProgramsByName =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Per-request override -- set in wrap() from body's "program" field. */
+    private final ThreadLocal<Program> threadProgram = new ThreadLocal<>();
+
+    /**
+     * The Program a handler should target on this request. If the body
+     * carried a "program" field (set by wrap), returns that program; else
+     * falls back to the active (last-opened) program.
+     */
+    private Program currentProgram() {
+        Program p = threadProgram.get();
+        return p != null ? p : activeProgram;
+    }
 
     public GhidraMcpPlugin(PluginTool tool) {
         super(tool);
@@ -88,14 +105,45 @@ public class GhidraMcpPlugin extends ProgramPlugin {
 
     @Override
     protected void programOpened(Program program) {
+        openProgramsByName.put(program.getName(), program);
         activeProgram = program;
         startServer();
+        register();  // re-write registration JSON(s) for the new set of programs
     }
 
     @Override
     protected void programClosed(Program program) {
-        stopServer();
-        activeProgram = null;
+        openProgramsByName.remove(program.getName());
+        if (program == activeProgram) {
+            // Pick any other open program as the new active, or null
+            activeProgram = openProgramsByName.values().stream().findFirst().orElse(null);
+        }
+        register();   // refresh registration JSONs (this one removed)
+        if (openProgramsByName.isEmpty()) {
+            stopServer();
+        }
+    }
+
+    /**
+     * Pick which Program a request targets, using the `program` field in the
+     * body if present (substring match against open program names), else the
+     * active program. Returns null only if nothing is open.
+     */
+    private Program resolveProgram(Map<String, String> body) {
+        if (body != null) {
+            String name = body.get("program");
+            if (name != null && !name.isEmpty()) {
+                String wanted = name.toLowerCase();
+                for (java.util.Map.Entry<String, Program> e : openProgramsByName.entrySet()) {
+                    if (e.getKey().toLowerCase().contains(wanted)) {
+                        return e.getValue();
+                    }
+                }
+                // No match: explicit target asked for, return null to signal
+                return null;
+            }
+        }
+        return activeProgram;
     }
 
     // If the plugin is enabled mid-session (the common case the first time
@@ -127,8 +175,11 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     // ------------------------------------------------------------------
 
     private void startServer() {
+        // Multi-program support: if the server is already running, just
+        // refresh the registration file(s) and return. We never want to
+        // bounce the HTTP port when a second program opens.
         if (server != null) {
-            stopServer();
+            return;
         }
         if (activeProgram == null) {
             return;
@@ -142,6 +193,8 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             if (!decompiler.openProgram(activeProgram)) {
                 Msg.warn(this, "[MCP] Failed to init decompiler: " +
                     decompiler.getLastMessage());
+            } else {
+                lastDecompiledProgram = activeProgram;
             }
 
             serverPort = findFreePort();
@@ -232,19 +285,49 @@ public class GhidraMcpPlugin extends ProgramPlugin {
         try {
             Path dir = Paths.get(REGISTRATION_DIR);
             Files.createDirectories(dir);
-
             long pid = ProcessHandle.current().pid();
-            String programPath = activeProgram.getExecutablePath();
 
-            String json = "{\n" +
-                "  \"pid\": " + pid + ",\n" +
-                "  \"port\": " + serverPort + ",\n" +
-                "  \"program\": \"" + escapeJson(activeProgram.getName()) + "\",\n" +
-                "  \"program_path\": \"" + escapeJson(programPath) + "\"\n" +
-                "}";
+            // 1) Clean up our existing JSONs for this pid so closed programs
+            //    don't leave stale entries.
+            try (java.util.stream.Stream<Path> entries = Files.list(dir)) {
+                String prefix = pid + "_";
+                entries.filter(p -> {
+                    String n = p.getFileName().toString();
+                    return n.equals(pid + ".json") || n.startsWith(prefix);
+                }).forEach(p -> {
+                    try { Files.deleteIfExists(p); } catch (Exception ignored) {}
+                });
+            }
 
-            Path regFile = dir.resolve(pid + ".json");
-            Files.write(regFile, json.getBytes(StandardCharsets.UTF_8));
+            // 2) Write one JSON per currently-open program. This lets the host
+            //    resolve_instance(target='libsentry') route to the right port,
+            //    and the body's "program" field then picks the right Program
+            //    inside the plugin.
+            for (Program p : openProgramsByName.values()) {
+                String name = p.getName();
+                String safeName = name.replaceAll("[^A-Za-z0-9._-]", "_");
+                String json = "{\n" +
+                    "  \"pid\": " + pid + ",\n" +
+                    "  \"port\": " + serverPort + ",\n" +
+                    "  \"program\": \"" + escapeJson(name) + "\",\n" +
+                    "  \"program_path\": \"" + escapeJson(p.getExecutablePath()) + "\"\n" +
+                    "}";
+                Path regFile = dir.resolve(pid + "_" + safeName + ".json");
+                Files.write(regFile, json.getBytes(StandardCharsets.UTF_8));
+            }
+
+            // 3) Also keep a legacy <pid>.json pointing at the active program
+            //    (for any client that finds instances by exact filename pattern).
+            if (activeProgram != null) {
+                String json = "{\n" +
+                    "  \"pid\": " + pid + ",\n" +
+                    "  \"port\": " + serverPort + ",\n" +
+                    "  \"program\": \"" + escapeJson(currentProgram().getName()) + "\",\n" +
+                    "  \"program_path\": \"" + escapeJson(currentProgram().getExecutablePath()) + "\"\n" +
+                    "}";
+                Path regFile = dir.resolve(pid + ".json");
+                Files.write(regFile, json.getBytes(StandardCharsets.UTF_8));
+            }
         } catch (Exception e) {
             Msg.error(this, "[MCP] Registration failed", e);
         }
@@ -253,8 +336,17 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     private void unregister() {
         try {
             long pid = ProcessHandle.current().pid();
-            Path regFile = Paths.get(REGISTRATION_DIR, pid + ".json");
-            Files.deleteIfExists(regFile);
+            Path dir = Paths.get(REGISTRATION_DIR);
+            // Delete legacy + all per-program registration files for this pid
+            try (java.util.stream.Stream<Path> entries = Files.list(dir)) {
+                String prefix = pid + "_";
+                entries.filter(p -> {
+                    String n = p.getFileName().toString();
+                    return n.equals(pid + ".json") || n.startsWith(prefix);
+                }).forEach(p -> {
+                    try { Files.deleteIfExists(p); } catch (Exception ignored) {}
+                });
+            }
         } catch (Exception ignored) {
             // best-effort
         }
@@ -297,7 +389,16 @@ public class GhidraMcpPlugin extends ProgramPlugin {
 
     private static Map<String, String> parseJsonBody(HttpExchange exchange)
             throws IOException {
+        // Cache the parsed body on the exchange so wrap() can pre-parse it
+        // for program-resolution, and the handler can re-parse without losing
+        // the InputStream (which is consumable once).
+        @SuppressWarnings("unchecked")
+        Map<String, String> cached = (Map<String, String>) exchange.getAttribute("mcp_parsed_body");
+        if (cached != null) {
+            return cached;
+        }
         Map<String, String> result = new LinkedHashMap<>();
+        exchange.setAttribute("mcp_parsed_body", result);
         if (!"POST".equals(exchange.getRequestMethod())) {
             return result;
         }
@@ -405,7 +506,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             addrStr = addrStr.substring(2);
         }
         try {
-            return activeProgram.getAddressFactory()
+            return currentProgram().getAddressFactory()
                 .getDefaultAddressSpace().getAddress(addrStr);
         } catch (Exception e) {
             return null;
@@ -454,7 +555,19 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     private HttpHandler wrap(EndpointHandler handler) {
         return exchange -> {
             try {
-                handler.handle(exchange);
+                // Pre-parse body so we can resolve which Program to target
+                // (handlers can call parseJsonBody again -- result is cached
+                //  on the exchange attributes so it costs nothing).
+                Map<String, String> body = parseJsonBody(exchange);
+                Program target = resolveProgram(body);
+                if (target != null) {
+                    threadProgram.set(target);
+                }
+                try {
+                    handler.handle(exchange);
+                } finally {
+                    threadProgram.remove();
+                }
             } catch (InvocationTargetException e) {
                 Throwable cause = e.getCause();
                 Msg.error(GhidraMcpPlugin.this, "[MCP] Handler error", cause);
@@ -474,7 +587,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     // ------------------------------------------------------------------
 
     private Function findFunctionByName(String name) {
-        Listing listing = activeProgram.getListing();
+        Listing listing = currentProgram().getListing();
 
         // Exact match
         FunctionIterator funcs = listing.getFunctions(true);
@@ -496,7 +609,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
         }
 
         // Symbol table wildcard
-        SymbolTable st = activeProgram.getSymbolTable();
+        SymbolTable st = currentProgram().getSymbolTable();
         SymbolIterator syms = st.getSymbolIterator("*" + name + "*", true);
         while (syms.hasNext()) {
             Symbol sym = syms.next();
@@ -511,7 +624,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     private Function resolveFunction(Map<String, String> body) {
         String addrStr = body.get("address");
         String name = body.get("name");
-        Listing listing = activeProgram.getListing();
+        Listing listing = currentProgram().getListing();
 
         if (name != null && !name.isEmpty()) {
             return findFunctionByName(name);
@@ -538,7 +651,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     private void handlePing(HttpExchange ex) throws Exception {
         String json = onSwing(() ->
             "{" + jp("status", "ok") + ", " +
-                jp("program", activeProgram.getName()) + "}"
+                jp("program", currentProgram().getName()) + "}"
         );
         respond(ex, json);
     }
@@ -547,24 +660,24 @@ public class GhidraMcpPlugin extends ProgramPlugin {
 
     private void handleInfo(HttpExchange ex) throws Exception {
         String json = onSwing(() -> {
-            Listing listing = activeProgram.getListing();
+            Listing listing = currentProgram().getListing();
             int funcCount = 0;
             FunctionIterator fi = listing.getFunctions(true);
             while (fi.hasNext()) { fi.next(); funcCount++; }
 
             int segCount = 0;
-            for (MemoryBlock ignored : activeProgram.getMemory().getBlocks()) {
+            for (MemoryBlock ignored : currentProgram().getMemory().getBlocks()) {
                 segCount++;
             }
 
             String processor =
-                activeProgram.getLanguage().getProcessor().toString();
-            int bits = activeProgram.getDefaultPointerSize() * 8;
+                currentProgram().getLanguage().getProcessor().toString();
+            int bits = currentProgram().getDefaultPointerSize() * 8;
 
             StringBuilder sb = new StringBuilder();
             sb.append("{");
-            sb.append(jp("file", activeProgram.getName())).append(", ");
-            sb.append(jp("path", activeProgram.getExecutablePath())).append(", ");
+            sb.append(jp("file", currentProgram().getName())).append(", ");
+            sb.append(jp("path", currentProgram().getExecutablePath())).append(", ");
             sb.append(jp("functions", funcCount)).append(", ");
             sb.append(jp("segments", segCount)).append(", ");
             sb.append(jp("processor", processor)).append(", ");
@@ -582,7 +695,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             StringBuilder sb = new StringBuilder();
             sb.append("[");
             boolean first = true;
-            for (MemoryBlock block : activeProgram.getMemory().getBlocks()) {
+            for (MemoryBlock block : currentProgram().getMemory().getBlocks()) {
                 if (!first) sb.append(", ");
                 first = false;
 
@@ -618,6 +731,17 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 return "{" + jp("error", "Decompiler not initialised") + "}";
             }
             synchronized (decompiler) {
+                // Switch the decompiler's program if the target differs from
+                // the one currently open (multi-program support).
+                Program p = currentProgram();
+                if (p != null && p != lastDecompiledProgram) {
+                    if (!decompiler.openProgram(p)) {
+                        return "{" + jp("error",
+                            "Decompiler openProgram failed: " +
+                            decompiler.getLastMessage()) + "}";
+                    }
+                    lastDecompiledProgram = p;
+                }
                 DecompileResults results = decompiler.decompileFunction(
                     func, 60, TaskMonitor.DUMMY);
                 if (results == null || !results.decompileCompleted()) {
@@ -653,7 +777,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             if (func == null) {
                 return "{" + jp("error", "Function not found") + "}";
             }
-            Listing listing = activeProgram.getListing();
+            Listing listing = currentProgram().getListing();
             StringBuilder sb = new StringBuilder();
             sb.append("{");
             sb.append(jp("name", func.getName())).append(", ");
@@ -729,7 +853,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             List<String> results = new ArrayList<>();
             int count = 0;
             FunctionIterator funcs =
-                activeProgram.getListing().getFunctions(true);
+                currentProgram().getListing().getFunctions(true);
             while (funcs.hasNext() && count < 100) {
                 Function func = funcs.next();
                 if (func.getName().toLowerCase().contains(patLower)) {
@@ -770,13 +894,13 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 return "{" + jp("error", "Invalid address") + "}";
             }
 
-            SymbolTable symTable = activeProgram.getSymbolTable();
+            SymbolTable symTable = currentProgram().getSymbolTable();
             Symbol existing = symTable.getPrimarySymbol(addr);
             String oldName = (existing != null)
                 ? existing.getName() : formatAddr(addr);
 
             boolean success = false;
-            int txId = activeProgram.startTransaction("MCP Rename");
+            int txId = currentProgram().startTransaction("MCP Rename");
             try {
                 if (existing != null) {
                     existing.setName(newName, SourceType.USER_DEFINED);
@@ -790,7 +914,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 Msg.error(GhidraMcpPlugin.this,
                     "[MCP] Rename failed at " + formatAddr(addr), e);
             } finally {
-                activeProgram.endTransaction(txId, success);
+                currentProgram().endTransaction(txId, success);
             }
 
             if (success) {
@@ -838,9 +962,9 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             }
 
             boolean success = false;
-            int txId = activeProgram.startTransaction("MCP Comment");
+            int txId = currentProgram().startTransaction("MCP Comment");
             try {
-                activeProgram.getListing().setComment(
+                currentProgram().getListing().setComment(
                     addr, commentType,
                     comment != null ? comment : "");
                 success = true;
@@ -848,7 +972,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 Msg.error(GhidraMcpPlugin.this,
                     "[MCP] Comment failed at " + formatAddr(addr), e);
             } finally {
-                activeProgram.endTransaction(txId, success);
+                currentProgram().endTransaction(txId, success);
             }
 
             if (success) {
@@ -896,7 +1020,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 return "{" + jp("success", false) + ", " +
                        jp("error", "Invalid address") + "}";
             }
-            MemoryBlock block = activeProgram.getMemory().getBlock(addr);
+            MemoryBlock block = currentProgram().getMemory().getBlock(addr);
             if (block == null) {
                 return "{" + jp("success", false) + ", " +
                        jp("error", "No memory block at " + formatAddr(addr)) +
@@ -907,7 +1031,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             boolean wantW = pU.contains("W");
             boolean wantX = pU.contains("X");
             boolean success = false;
-            int txId = activeProgram.startTransaction("MCP Set Block Perms");
+            int txId = currentProgram().startTransaction("MCP Set Block Perms");
             try {
                 block.setRead(wantR);
                 block.setWrite(wantW);
@@ -916,7 +1040,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             } catch (Exception e) {
                 Msg.error(this, "[MCP] SET PERMS FAILED " + block.getName(), e);
             } finally {
-                activeProgram.endTransaction(txId, success);
+                currentProgram().endTransaction(txId, success);
             }
             String perms = "";
             if (block.isRead()) perms += "R";
@@ -963,14 +1087,14 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             }
             boolean success = false;
             long byteCount = 0;
-            int txId = activeProgram.startTransaction("MCP Analyze Range");
+            int txId = currentProgram().startTransaction("MCP Analyze Range");
             try {
                 AddressSet set = new AddressSet(start, end);
                 DisassembleCommand cmd =
                     new DisassembleCommand(set, null, true);
-                cmd.applyTo(activeProgram, TaskMonitor.DUMMY);
+                cmd.applyTo(currentProgram(), TaskMonitor.DUMMY);
                 AutoAnalysisManager mgr =
-                    AutoAnalysisManager.getAnalysisManager(activeProgram);
+                    AutoAnalysisManager.getAnalysisManager(currentProgram());
                 if (mgr != null) {
                     mgr.startAnalysis(TaskMonitor.DUMMY);
                     mgr.waitForAnalysis(null, TaskMonitor.DUMMY);
@@ -980,7 +1104,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             } catch (Exception e) {
                 Msg.error(this, "[MCP] ANALYZE RANGE FAILED", e);
             } finally {
-                activeProgram.endTransaction(txId, success);
+                currentProgram().endTransaction(txId, success);
             }
             if (success) {
                 Msg.info(this, "[MCP] ANALYZE RANGE " + formatAddr(start) +
@@ -1012,7 +1136,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             String patternLower = pattern.toLowerCase();
             List<String> results = new ArrayList<>();
             int count = 0;
-            DataIterator dataIter = activeProgram.getListing().getDefinedData(true);
+            DataIterator dataIter = currentProgram().getListing().getDefinedData(true);
             while (dataIter.hasNext() && count < 100) {
                 Data data = dataIter.next();
                 if (!data.hasStringValue()) continue;
@@ -1055,11 +1179,11 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 return "{" + jp("error", "Provide valid 'address' or 'name'") + "}";
             }
             ghidra.program.model.symbol.ReferenceIterator refsIter =
-                activeProgram.getReferenceManager().getReferencesTo(addr);
+                currentProgram().getReferenceManager().getReferencesTo(addr);
             List<String> entries = new ArrayList<>();
             while (refsIter.hasNext()) {
                 Reference ref = refsIter.next();
-                Function fromFunc = activeProgram.getListing()
+                Function fromFunc = currentProgram().getListing()
                     .getFunctionContaining(ref.getFromAddress());
                 String fromFuncName = fromFunc != null ? fromFunc.getName() : "";
                 StringBuilder entry = new StringBuilder();
@@ -1090,11 +1214,11 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             if (addr == null) {
                 return "{" + jp("error", "Invalid address") + "}";
             }
-            Reference[] refs = activeProgram.getReferenceManager().getReferencesFrom(addr);
+            Reference[] refs = currentProgram().getReferenceManager().getReferencesFrom(addr);
             List<String> entries = new ArrayList<>();
             for (Reference ref : refs) {
                 Address toAddr = ref.getToAddress();
-                Symbol sym = activeProgram.getSymbolTable().getPrimarySymbol(toAddr);
+                Symbol sym = currentProgram().getSymbolTable().getPrimarySymbol(toAddr);
                 String symName = sym != null ? sym.getName() : "";
                 StringBuilder entry = new StringBuilder();
                 entry.append("{");
@@ -1124,13 +1248,13 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             Set<String> seen = new LinkedHashSet<>();
             List<String> entries = new ArrayList<>();
             ghidra.program.model.symbol.ReferenceIterator refsIter =
-                activeProgram.getReferenceManager()
+                currentProgram().getReferenceManager()
                     .getReferencesTo(func.getEntryPoint());
             while (refsIter.hasNext()) {
                 Reference ref = refsIter.next();
                 if (!ref.getReferenceType().isCall() &&
                     !ref.getReferenceType().isJump()) continue;
-                Function caller = activeProgram.getListing()
+                Function caller = currentProgram().getListing()
                     .getFunctionContaining(ref.getFromAddress());
                 if (caller == null) continue;
                 if (caller.getEntryPoint().equals(func.getEntryPoint())) continue;
@@ -1160,12 +1284,12 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             }
             Set<String> seen = new LinkedHashSet<>();
             List<String> entries = new ArrayList<>();
-            Listing listing = activeProgram.getListing();
+            Listing listing = currentProgram().getListing();
             InstructionIterator instructions =
                 listing.getInstructions(func.getBody(), true);
             while (instructions.hasNext()) {
                 Instruction instr = instructions.next();
-                Reference[] refs = activeProgram.getReferenceManager()
+                Reference[] refs = currentProgram().getReferenceManager()
                     .getReferencesFrom(instr.getAddress());
                 for (Reference ref : refs) {
                     if (!ref.getReferenceType().isCall() &&
@@ -1216,7 +1340,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             byte[] buf = new byte[sz];
             int read;
             try {
-                read = activeProgram.getMemory().getBytes(addr, buf);
+                read = currentProgram().getMemory().getBytes(addr, buf);
             } catch (Exception e) {
                 return "{" + jp("error",
                     "Cannot read bytes at address: " + e.getMessage()) + "}";
@@ -1262,24 +1386,24 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 ? parseAddress(endStr) : null;
             boolean success = false;
             Function func = null;
-            int txId = activeProgram.startTransaction("MCP Create Function");
+            int txId = currentProgram().startTransaction("MCP Create Function");
             try {
                 if (end != null) {
                     AddressSet bodySet = new AddressSet(addr, end);
-                    func = activeProgram.getListing().createFunction(
+                    func = currentProgram().getListing().createFunction(
                         null, addr, bodySet,
                         ghidra.program.model.symbol.SourceType.USER_DEFINED);
                 } else {
                     ghidra.app.cmd.function.CreateFunctionCmd cmd =
                         new ghidra.app.cmd.function.CreateFunctionCmd(addr);
-                    cmd.applyTo(activeProgram, TaskMonitor.DUMMY);
-                    func = activeProgram.getListing().getFunctionAt(addr);
+                    cmd.applyTo(currentProgram(), TaskMonitor.DUMMY);
+                    func = currentProgram().getListing().getFunctionAt(addr);
                 }
                 success = (func != null);
             } catch (Exception e) {
                 Msg.error(this, "[MCP] CREATE FUNC FAILED " + formatAddr(addr), e);
             } finally {
-                activeProgram.endTransaction(txId, success);
+                currentProgram().endTransaction(txId, success);
             }
             StringBuilder sb = new StringBuilder();
             sb.append("{");
@@ -1343,7 +1467,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             boolean success = false;
             int txId = -1;
             if (commit) {
-                txId = activeProgram.startTransaction("MCP Exec Script");
+                txId = currentProgram().startTransaction("MCP Exec Script");
             }
             try {
                 org.python.util.PythonInterpreter interp =
@@ -1351,7 +1475,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 try {
                     interp.setOut(ps);
                     interp.setErr(ps);
-                    interp.set("currentProgram", activeProgram);
+                    interp.set("currentProgram", currentProgram());
                     interp.set("monitor", TaskMonitor.DUMMY);
                     interp.exec(
                         "from ghidra.program.flatapi import FlatProgramAPI\n" +
@@ -1376,7 +1500,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 Msg.error(this, "[MCP] EXEC SCRIPT FAILED", t);
             } finally {
                 if (commit) {
-                    activeProgram.endTransaction(txId, success);
+                    currentProgram().endTransaction(txId, success);
                 }
             }
             String stdout;
