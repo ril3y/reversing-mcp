@@ -17,6 +17,8 @@ import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileOptions;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.script.GhidraScript;
+import ghidra.app.cmd.disassemble.DisassembleCommand;
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressFactory;
 import ghidra.program.model.address.AddressSet;
@@ -87,6 +89,8 @@ public class ghidra_mcp_bridge extends GhidraScript {
         server.createContext("/comment", new CommentHandler());
         server.createContext("/create_function", new CreateFunctionHandler());
         server.createContext("/delete_function", new DeleteFunctionHandler());
+        server.createContext("/set_segment_perms", new SetSegmentPermsHandler());
+        server.createContext("/analyze_range", new AnalyzeRangeHandler());
 
         server.start();
         String regPath = register(serverPort);
@@ -825,6 +829,88 @@ public class ghidra_mcp_bridge extends GhidraScript {
         return sb.toString();
     }
 
+    private String setSegmentPerms(Address addr, String permStr) {
+        MemoryBlock block = currentProgram.getMemory().getBlock(addr);
+        if (block == null) {
+            return "{" + jsonPair("success", false) + ", " +
+                   jsonPair("error", "No memory block at " + formatAddress(addr)) + "}";
+        }
+        String permU = permStr.toUpperCase();
+        boolean wantR = permU.contains("R");
+        boolean wantW = permU.contains("W");
+        boolean wantX = permU.contains("X");
+        boolean success = false;
+        int txId = currentProgram.startTransaction("MCP Set Block Permissions");
+        try {
+            block.setRead(wantR);
+            block.setWrite(wantW);
+            block.setExecute(wantX);
+            success = true;
+        } catch (Exception e) {
+            println("[MCP] SET PERMS FAILED " + block.getName() + ": " + e.getMessage());
+        } finally {
+            currentProgram.endTransaction(txId, success);
+        }
+
+        String perms = "";
+        if (block.isRead()) perms += "R";
+        if (block.isWrite()) perms += "W";
+        if (block.isExecute()) perms += "X";
+
+        if (success) {
+            println("[MCP] SET PERMS " + block.getName() + " = " + perms);
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("{");
+        sb.append(jsonPair("success", success)).append(", ");
+        sb.append(jsonPair("block", block.getName())).append(", ");
+        sb.append(jsonPair("start", formatAddress(block.getStart()))).append(", ");
+        sb.append(jsonPair("end", formatAddress(block.getEnd()))).append(", ");
+        sb.append(jsonPair("perms", perms));
+        sb.append("}");
+        return sb.toString();
+    }
+
+    private String analyzeRange(Address start, Address end) {
+        boolean success = false;
+        long bytesAnalyzed = 0;
+        int txId = currentProgram.startTransaction("MCP Analyze Range");
+        try {
+            // Disassemble the range first; AutoAnalysisManager will pick it up
+            AddressSet rangeSet = new AddressSet(start, end);
+            DisassembleCommand cmd = new DisassembleCommand(rangeSet, null, true);
+            cmd.applyTo(currentProgram, monitor);
+            // Now flush pending analysis
+            AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(currentProgram);
+            if (mgr != null) {
+                mgr.startAnalysis(monitor);
+                mgr.waitForAnalysis(null, monitor);
+            }
+            bytesAnalyzed = rangeSet.getNumAddresses();
+            success = true;
+        } catch (Exception e) {
+            println("[MCP] ANALYZE RANGE FAILED " + formatAddress(start) +
+                    "-" + formatAddress(end) + ": " + e.getMessage());
+        } finally {
+            currentProgram.endTransaction(txId, success);
+        }
+
+        if (success) {
+            println("[MCP] ANALYZE RANGE " + formatAddress(start) + "-" +
+                    formatAddress(end) + " (" + bytesAnalyzed + " bytes)");
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("{");
+        sb.append(jsonPair("success", success)).append(", ");
+        sb.append(jsonPair("start", formatAddress(start))).append(", ");
+        sb.append(jsonPair("end", formatAddress(end))).append(", ");
+        sb.append(jsonPair("bytes", bytesAnalyzed));
+        sb.append("}");
+        return sb.toString();
+    }
+
     // -----------------------------------------------------------------------
     // Utility
     // -----------------------------------------------------------------------
@@ -1224,6 +1310,53 @@ public class ghidra_mcp_bridge extends GhidraScript {
             }
 
             respond(exchange, deleteFunction(addr));
+        }
+    }
+
+    private class SetSegmentPermsHandler extends BaseHandler {
+        void handleRequest(HttpExchange exchange) throws Exception {
+            Map<String, String> body = parseJsonBody(exchange);
+            String addrStr = body.get("address");
+            String permStr = body.get("perms");
+
+            if (addrStr == null || addrStr.isEmpty()) {
+                respondError(exchange, "Provide 'address'", 400);
+                return;
+            }
+            if (permStr == null) {
+                respondError(exchange, "Provide 'perms' (e.g. 'RX', 'RWX', 'R')", 400);
+                return;
+            }
+
+            Address addr = parseAddress(addrStr);
+            if (addr == null) {
+                respondError(exchange, "Invalid address", 400);
+                return;
+            }
+
+            respond(exchange, setSegmentPerms(addr, permStr));
+        }
+    }
+
+    private class AnalyzeRangeHandler extends BaseHandler {
+        void handleRequest(HttpExchange exchange) throws Exception {
+            Map<String, String> body = parseJsonBody(exchange);
+            String startStr = body.get("start");
+            String endStr = body.get("end");
+
+            if (startStr == null || endStr == null) {
+                respondError(exchange, "Provide 'start' and 'end'", 400);
+                return;
+            }
+
+            Address start = parseAddress(startStr);
+            Address end = parseAddress(endStr);
+            if (start == null || end == null) {
+                respondError(exchange, "Invalid address", 400);
+                return;
+            }
+
+            respond(exchange, analyzeRange(start, end));
         }
     }
 }

@@ -23,9 +23,31 @@ NAME_KEYS = ("program", "program_path")
 mcp = FastMCP("ghidra")
 
 
+# Per-endpoint timeouts. Ghidra operations vary wildly in cost:
+# fast lookups (info, function, segments) finish in <1s; analysis-touching ones
+# (create_function, decompile, analyze_range) can run minutes on large segments.
+# Anything not in this map falls back to DEFAULT_TIMEOUT.
+DEFAULT_TIMEOUT = 60
+ENDPOINT_TIMEOUTS = {
+    "/decompile": 180,
+    "/create_function": 180,
+    "/analyze_range": 600,
+    "/set_segment_perms": 30,
+    "/search_functions": 60,
+    "/search_strings": 60,
+    "/xrefs_to": 60,
+    "/xrefs_from": 60,
+    "/callers": 60,
+    "/callees": 120,    # iterates instructions, can be slow on large functions
+    "/bytes": 15,
+    "/exec_script": 600,  # arbitrary Jython; can be long
+}
+
+
 def _call(endpoint, body=None, program=None):
+    timeout = ENDPOINT_TIMEOUTS.get(endpoint, DEFAULT_TIMEOUT)
     return call_instance(REG_DIR, endpoint, body, target=program,
-                         tool_name=TOOL, name_keys=NAME_KEYS, timeout=60)
+                         tool_name=TOOL, name_keys=NAME_KEYS, timeout=timeout)
 
 
 @mcp.tool()
@@ -241,6 +263,80 @@ def delete_function(address: str, program: str = "") -> dict:
         program: Program name substring to target (optional)
     """
     return _call("/delete_function", {"address": address}, program=program or None)
+
+
+@mcp.tool()
+def set_segment_perms(address: str, perms: str, program: str = "") -> dict:
+    """Set read/write/execute permissions on the memory block containing an
+    address. Use this when a code segment was loaded as data-only (e.g., Ghidra
+    sometimes marks ARM ELF LOAD-RX segments as just R, preventing auto-analysis).
+
+    After flipping permissions, call analyze_range over the segment to force
+    disassembly + function discovery.
+
+    Args:
+        address: Any address inside the target memory block (hex).
+        perms: Permission string e.g. 'RX' / 'RWX' / 'R'. Letters are matched
+            case-insensitively; missing letters clear that bit.
+        program: Program name substring to target (optional).
+    """
+    return _call("/set_segment_perms",
+                 {"address": address, "perms": perms},
+                 program=program or None)
+
+
+@mcp.tool()
+def analyze_range(start: str, end: str, program: str = "") -> dict:
+    """Force disassembly + auto-analysis over a byte range. Useful after
+    flipping a segment to executable, or when Ghidra missed a code region.
+
+    Long-running on large segments (analysis can take several minutes); this
+    endpoint has a 10-minute server-side timeout.
+
+    Args:
+        start: Start address (hex, inclusive).
+        end: End address (hex, inclusive).
+        program: Program name substring to target (optional).
+    """
+    return _call("/analyze_range",
+                 {"start": start, "end": end},
+                 program=program or None)
+
+
+@mcp.tool()
+def exec_script(code: str, commit: bool = True, program: str = "") -> dict:
+    """Execute arbitrary Jython 2.7 code against the loaded program with full
+    Ghidra API access. Returns a dict with `success`, `stdout` (captured print
+    output), `committed` (whether wrapped in a DB transaction), and optionally
+    `error`.
+
+    Pre-populated globals in the script context:
+        currentProgram  -- the active Program instance
+        monitor         -- TaskMonitor.DUMMY
+        fpapi           -- FlatProgramAPI(currentProgram)
+    And wildcard-imported:
+        ghidra.program.flatapi
+        ghidra.program.model.address / .listing / .symbol / .mem / .scalar
+        ghidra.util.task (TaskMonitor)
+
+    Use this when the dedicated endpoints aren't expressive enough -- bulk
+    vtable-call resolution, custom xref hunts, struct field mapping, mass
+    rename/comment scans, anything that benefits from raw Ghidra API access.
+
+    Use `commit=False` for read-only analysis scripts (faster, can't dirty
+    the DB on a script bug). Use `commit=True` (default) when the script
+    needs to mutate the program (rename, addComment, createFunction, etc).
+
+    Args:
+        code: Jython source. Use `print()` for output. The script runs to
+            completion (or hits the 10-minute server-side timeout).
+        commit: If True (default), wrap execution in a Ghidra DB transaction.
+            If False, no transaction is opened (read-only mode).
+        program: Program name substring to target (optional).
+    """
+    return _call("/exec_script",
+                 {"code": code, "commit": "true" if commit else "false"},
+                 program=program or None)
 
 
 if __name__ == "__main__":

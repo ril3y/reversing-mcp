@@ -14,10 +14,13 @@ import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 
 import ghidra.MiscellaneousPluginPackage;
+import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileOptions;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.plugin.ProgramPlugin;
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
+import ghidra.program.model.address.AddressSet;
 import ghidra.framework.plugintool.PluginInfo;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.framework.plugintool.util.PluginStatus;
@@ -67,7 +70,24 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     private ExecutorService serverExecutor;
     private int serverPort;
     private DecompInterface decompiler;
+    private Program lastDecompiledProgram;
     private Program activeProgram;
+    /** All programs currently opened in this tool, keyed by program name. */
+    private final java.util.concurrent.ConcurrentHashMap<String, Program> openProgramsByName =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Per-request override -- set in wrap() from body's "program" field. */
+    private final ThreadLocal<Program> threadProgram = new ThreadLocal<>();
+
+    /**
+     * The Program a handler should target on this request. If the body
+     * carried a "program" field (set by wrap), returns that program; else
+     * falls back to the active (last-opened) program.
+     */
+    private Program currentProgram() {
+        Program p = threadProgram.get();
+        return p != null ? p : activeProgram;
+    }
 
     public GhidraMcpPlugin(PluginTool tool) {
         super(tool);
@@ -85,14 +105,45 @@ public class GhidraMcpPlugin extends ProgramPlugin {
 
     @Override
     protected void programOpened(Program program) {
+        openProgramsByName.put(program.getName(), program);
         activeProgram = program;
         startServer();
+        register();  // re-write registration JSON(s) for the new set of programs
     }
 
     @Override
     protected void programClosed(Program program) {
-        stopServer();
-        activeProgram = null;
+        openProgramsByName.remove(program.getName());
+        if (program == activeProgram) {
+            // Pick any other open program as the new active, or null
+            activeProgram = openProgramsByName.values().stream().findFirst().orElse(null);
+        }
+        register();   // refresh registration JSONs (this one removed)
+        if (openProgramsByName.isEmpty()) {
+            stopServer();
+        }
+    }
+
+    /**
+     * Pick which Program a request targets, using the `program` field in the
+     * body if present (substring match against open program names), else the
+     * active program. Returns null only if nothing is open.
+     */
+    private Program resolveProgram(Map<String, String> body) {
+        if (body != null) {
+            String name = body.get("program");
+            if (name != null && !name.isEmpty()) {
+                String wanted = name.toLowerCase();
+                for (java.util.Map.Entry<String, Program> e : openProgramsByName.entrySet()) {
+                    if (e.getKey().toLowerCase().contains(wanted)) {
+                        return e.getValue();
+                    }
+                }
+                // No match: explicit target asked for, return null to signal
+                return null;
+            }
+        }
+        return activeProgram;
     }
 
     // If the plugin is enabled mid-session (the common case the first time
@@ -124,8 +175,11 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     // ------------------------------------------------------------------
 
     private void startServer() {
+        // Multi-program support: if the server is already running, just
+        // refresh the registration file(s) and return. We never want to
+        // bounce the HTTP port when a second program opens.
         if (server != null) {
-            stopServer();
+            return;
         }
         if (activeProgram == null) {
             return;
@@ -139,6 +193,8 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             if (!decompiler.openProgram(activeProgram)) {
                 Msg.warn(this, "[MCP] Failed to init decompiler: " +
                     decompiler.getLastMessage());
+            } else {
+                lastDecompiledProgram = activeProgram;
             }
 
             serverPort = findFreePort();
@@ -166,6 +222,16 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             server.createContext("/search_functions", wrap(this::handleSearchFunctions));
             server.createContext("/rename", wrap(this::handleRename));
             server.createContext("/comment", wrap(this::handleComment));
+            server.createContext("/set_segment_perms", wrap(this::handleSetSegmentPerms));
+            server.createContext("/analyze_range", wrap(this::handleAnalyzeRange));
+            server.createContext("/search_strings", wrap(this::handleSearchStrings));
+            server.createContext("/xrefs_to", wrap(this::handleXrefsTo));
+            server.createContext("/xrefs_from", wrap(this::handleXrefsFrom));
+            server.createContext("/callers", wrap(this::handleCallers));
+            server.createContext("/callees", wrap(this::handleCallees));
+            server.createContext("/bytes", wrap(this::handleBytes));
+            server.createContext("/create_function", wrap(this::handleCreateFunction));
+            server.createContext("/exec_script", wrap(this::handleExecScript));
 
             server.start();
 
@@ -219,19 +285,49 @@ public class GhidraMcpPlugin extends ProgramPlugin {
         try {
             Path dir = Paths.get(REGISTRATION_DIR);
             Files.createDirectories(dir);
-
             long pid = ProcessHandle.current().pid();
-            String programPath = activeProgram.getExecutablePath();
 
-            String json = "{\n" +
-                "  \"pid\": " + pid + ",\n" +
-                "  \"port\": " + serverPort + ",\n" +
-                "  \"program\": \"" + escapeJson(activeProgram.getName()) + "\",\n" +
-                "  \"program_path\": \"" + escapeJson(programPath) + "\"\n" +
-                "}";
+            // 1) Clean up our existing JSONs for this pid so closed programs
+            //    don't leave stale entries.
+            try (java.util.stream.Stream<Path> entries = Files.list(dir)) {
+                String prefix = pid + "_";
+                entries.filter(p -> {
+                    String n = p.getFileName().toString();
+                    return n.equals(pid + ".json") || n.startsWith(prefix);
+                }).forEach(p -> {
+                    try { Files.deleteIfExists(p); } catch (Exception ignored) {}
+                });
+            }
 
-            Path regFile = dir.resolve(pid + ".json");
-            Files.write(regFile, json.getBytes(StandardCharsets.UTF_8));
+            // 2) Write one JSON per currently-open program. This lets the host
+            //    resolve_instance(target='libsentry') route to the right port,
+            //    and the body's "program" field then picks the right Program
+            //    inside the plugin.
+            for (Program p : openProgramsByName.values()) {
+                String name = p.getName();
+                String safeName = name.replaceAll("[^A-Za-z0-9._-]", "_");
+                String json = "{\n" +
+                    "  \"pid\": " + pid + ",\n" +
+                    "  \"port\": " + serverPort + ",\n" +
+                    "  \"program\": \"" + escapeJson(name) + "\",\n" +
+                    "  \"program_path\": \"" + escapeJson(p.getExecutablePath()) + "\"\n" +
+                    "}";
+                Path regFile = dir.resolve(pid + "_" + safeName + ".json");
+                Files.write(regFile, json.getBytes(StandardCharsets.UTF_8));
+            }
+
+            // 3) Also keep a legacy <pid>.json pointing at the active program
+            //    (for any client that finds instances by exact filename pattern).
+            if (activeProgram != null) {
+                String json = "{\n" +
+                    "  \"pid\": " + pid + ",\n" +
+                    "  \"port\": " + serverPort + ",\n" +
+                    "  \"program\": \"" + escapeJson(currentProgram().getName()) + "\",\n" +
+                    "  \"program_path\": \"" + escapeJson(currentProgram().getExecutablePath()) + "\"\n" +
+                    "}";
+                Path regFile = dir.resolve(pid + ".json");
+                Files.write(regFile, json.getBytes(StandardCharsets.UTF_8));
+            }
         } catch (Exception e) {
             Msg.error(this, "[MCP] Registration failed", e);
         }
@@ -240,8 +336,17 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     private void unregister() {
         try {
             long pid = ProcessHandle.current().pid();
-            Path regFile = Paths.get(REGISTRATION_DIR, pid + ".json");
-            Files.deleteIfExists(regFile);
+            Path dir = Paths.get(REGISTRATION_DIR);
+            // Delete legacy + all per-program registration files for this pid
+            try (java.util.stream.Stream<Path> entries = Files.list(dir)) {
+                String prefix = pid + "_";
+                entries.filter(p -> {
+                    String n = p.getFileName().toString();
+                    return n.equals(pid + ".json") || n.startsWith(prefix);
+                }).forEach(p -> {
+                    try { Files.deleteIfExists(p); } catch (Exception ignored) {}
+                });
+            }
         } catch (Exception ignored) {
             // best-effort
         }
@@ -284,7 +389,16 @@ public class GhidraMcpPlugin extends ProgramPlugin {
 
     private static Map<String, String> parseJsonBody(HttpExchange exchange)
             throws IOException {
+        // Cache the parsed body on the exchange so wrap() can pre-parse it
+        // for program-resolution, and the handler can re-parse without losing
+        // the InputStream (which is consumable once).
+        @SuppressWarnings("unchecked")
+        Map<String, String> cached = (Map<String, String>) exchange.getAttribute("mcp_parsed_body");
+        if (cached != null) {
+            return cached;
+        }
         Map<String, String> result = new LinkedHashMap<>();
+        exchange.setAttribute("mcp_parsed_body", result);
         if (!"POST".equals(exchange.getRequestMethod())) {
             return result;
         }
@@ -392,7 +506,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             addrStr = addrStr.substring(2);
         }
         try {
-            return activeProgram.getAddressFactory()
+            return currentProgram().getAddressFactory()
                 .getDefaultAddressSpace().getAddress(addrStr);
         } catch (Exception e) {
             return null;
@@ -441,7 +555,19 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     private HttpHandler wrap(EndpointHandler handler) {
         return exchange -> {
             try {
-                handler.handle(exchange);
+                // Pre-parse body so we can resolve which Program to target
+                // (handlers can call parseJsonBody again -- result is cached
+                //  on the exchange attributes so it costs nothing).
+                Map<String, String> body = parseJsonBody(exchange);
+                Program target = resolveProgram(body);
+                if (target != null) {
+                    threadProgram.set(target);
+                }
+                try {
+                    handler.handle(exchange);
+                } finally {
+                    threadProgram.remove();
+                }
             } catch (InvocationTargetException e) {
                 Throwable cause = e.getCause();
                 Msg.error(GhidraMcpPlugin.this, "[MCP] Handler error", cause);
@@ -461,7 +587,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     // ------------------------------------------------------------------
 
     private Function findFunctionByName(String name) {
-        Listing listing = activeProgram.getListing();
+        Listing listing = currentProgram().getListing();
 
         // Exact match
         FunctionIterator funcs = listing.getFunctions(true);
@@ -483,7 +609,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
         }
 
         // Symbol table wildcard
-        SymbolTable st = activeProgram.getSymbolTable();
+        SymbolTable st = currentProgram().getSymbolTable();
         SymbolIterator syms = st.getSymbolIterator("*" + name + "*", true);
         while (syms.hasNext()) {
             Symbol sym = syms.next();
@@ -498,7 +624,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     private Function resolveFunction(Map<String, String> body) {
         String addrStr = body.get("address");
         String name = body.get("name");
-        Listing listing = activeProgram.getListing();
+        Listing listing = currentProgram().getListing();
 
         if (name != null && !name.isEmpty()) {
             return findFunctionByName(name);
@@ -525,7 +651,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     private void handlePing(HttpExchange ex) throws Exception {
         String json = onSwing(() ->
             "{" + jp("status", "ok") + ", " +
-                jp("program", activeProgram.getName()) + "}"
+                jp("program", currentProgram().getName()) + "}"
         );
         respond(ex, json);
     }
@@ -534,24 +660,24 @@ public class GhidraMcpPlugin extends ProgramPlugin {
 
     private void handleInfo(HttpExchange ex) throws Exception {
         String json = onSwing(() -> {
-            Listing listing = activeProgram.getListing();
+            Listing listing = currentProgram().getListing();
             int funcCount = 0;
             FunctionIterator fi = listing.getFunctions(true);
             while (fi.hasNext()) { fi.next(); funcCount++; }
 
             int segCount = 0;
-            for (MemoryBlock ignored : activeProgram.getMemory().getBlocks()) {
+            for (MemoryBlock ignored : currentProgram().getMemory().getBlocks()) {
                 segCount++;
             }
 
             String processor =
-                activeProgram.getLanguage().getProcessor().toString();
-            int bits = activeProgram.getDefaultPointerSize() * 8;
+                currentProgram().getLanguage().getProcessor().toString();
+            int bits = currentProgram().getDefaultPointerSize() * 8;
 
             StringBuilder sb = new StringBuilder();
             sb.append("{");
-            sb.append(jp("file", activeProgram.getName())).append(", ");
-            sb.append(jp("path", activeProgram.getExecutablePath())).append(", ");
+            sb.append(jp("file", currentProgram().getName())).append(", ");
+            sb.append(jp("path", currentProgram().getExecutablePath())).append(", ");
             sb.append(jp("functions", funcCount)).append(", ");
             sb.append(jp("segments", segCount)).append(", ");
             sb.append(jp("processor", processor)).append(", ");
@@ -569,7 +695,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             StringBuilder sb = new StringBuilder();
             sb.append("[");
             boolean first = true;
-            for (MemoryBlock block : activeProgram.getMemory().getBlocks()) {
+            for (MemoryBlock block : currentProgram().getMemory().getBlocks()) {
                 if (!first) sb.append(", ");
                 first = false;
 
@@ -605,6 +731,17 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 return "{" + jp("error", "Decompiler not initialised") + "}";
             }
             synchronized (decompiler) {
+                // Switch the decompiler's program if the target differs from
+                // the one currently open (multi-program support).
+                Program p = currentProgram();
+                if (p != null && p != lastDecompiledProgram) {
+                    if (!decompiler.openProgram(p)) {
+                        return "{" + jp("error",
+                            "Decompiler openProgram failed: " +
+                            decompiler.getLastMessage()) + "}";
+                    }
+                    lastDecompiledProgram = p;
+                }
                 DecompileResults results = decompiler.decompileFunction(
                     func, 60, TaskMonitor.DUMMY);
                 if (results == null || !results.decompileCompleted()) {
@@ -640,7 +777,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             if (func == null) {
                 return "{" + jp("error", "Function not found") + "}";
             }
-            Listing listing = activeProgram.getListing();
+            Listing listing = currentProgram().getListing();
             StringBuilder sb = new StringBuilder();
             sb.append("{");
             sb.append(jp("name", func.getName())).append(", ");
@@ -716,7 +853,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             List<String> results = new ArrayList<>();
             int count = 0;
             FunctionIterator funcs =
-                activeProgram.getListing().getFunctions(true);
+                currentProgram().getListing().getFunctions(true);
             while (funcs.hasNext() && count < 100) {
                 Function func = funcs.next();
                 if (func.getName().toLowerCase().contains(patLower)) {
@@ -757,13 +894,13 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 return "{" + jp("error", "Invalid address") + "}";
             }
 
-            SymbolTable symTable = activeProgram.getSymbolTable();
+            SymbolTable symTable = currentProgram().getSymbolTable();
             Symbol existing = symTable.getPrimarySymbol(addr);
             String oldName = (existing != null)
                 ? existing.getName() : formatAddr(addr);
 
             boolean success = false;
-            int txId = activeProgram.startTransaction("MCP Rename");
+            int txId = currentProgram().startTransaction("MCP Rename");
             try {
                 if (existing != null) {
                     existing.setName(newName, SourceType.USER_DEFINED);
@@ -777,7 +914,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 Msg.error(GhidraMcpPlugin.this,
                     "[MCP] Rename failed at " + formatAddr(addr), e);
             } finally {
-                activeProgram.endTransaction(txId, success);
+                currentProgram().endTransaction(txId, success);
             }
 
             if (success) {
@@ -825,9 +962,9 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             }
 
             boolean success = false;
-            int txId = activeProgram.startTransaction("MCP Comment");
+            int txId = currentProgram().startTransaction("MCP Comment");
             try {
-                activeProgram.getListing().setComment(
+                currentProgram().getListing().setComment(
                     addr, commentType,
                     comment != null ? comment : "");
                 success = true;
@@ -835,7 +972,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 Msg.error(GhidraMcpPlugin.this,
                     "[MCP] Comment failed at " + formatAddr(addr), e);
             } finally {
-                activeProgram.endTransaction(txId, success);
+                currentProgram().endTransaction(txId, success);
             }
 
             if (success) {
@@ -851,6 +988,535 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             sb.append("{");
             sb.append(jp("success", success)).append(", ");
             sb.append(jp("address", formatAddr(addr)));
+            sb.append("}");
+            return sb.toString();
+        });
+        respond(ex, json);
+    }
+
+    // POST /set_segment_perms --------------------------------------------
+    //
+    // Body: {"address": "<hex>", "perms": "RX" | "RWX" | "R" | ...}
+    //
+    // Flips R/W/X bits on the MemoryBlock containing `address`. Returns the
+    // resulting perms so callers can verify. Useful when Ghidra mis-loaded a
+    // LOAD-RX segment as data-only.
+
+    private void handleSetSegmentPerms(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String addrStr = body.get("address");
+        String permStr = body.get("perms");
+        if (addrStr == null || addrStr.isEmpty()) {
+            respondError(ex, "Provide 'address'", 400);
+            return;
+        }
+        if (permStr == null) {
+            respondError(ex, "Provide 'perms' (e.g. 'RX')", 400);
+            return;
+        }
+        String json = onSwing(() -> {
+            Address addr = parseAddress(addrStr);
+            if (addr == null) {
+                return "{" + jp("success", false) + ", " +
+                       jp("error", "Invalid address") + "}";
+            }
+            MemoryBlock block = currentProgram().getMemory().getBlock(addr);
+            if (block == null) {
+                return "{" + jp("success", false) + ", " +
+                       jp("error", "No memory block at " + formatAddr(addr)) +
+                       "}";
+            }
+            String pU = permStr.toUpperCase();
+            boolean wantR = pU.contains("R");
+            boolean wantW = pU.contains("W");
+            boolean wantX = pU.contains("X");
+            boolean success = false;
+            int txId = currentProgram().startTransaction("MCP Set Block Perms");
+            try {
+                block.setRead(wantR);
+                block.setWrite(wantW);
+                block.setExecute(wantX);
+                success = true;
+            } catch (Exception e) {
+                Msg.error(this, "[MCP] SET PERMS FAILED " + block.getName(), e);
+            } finally {
+                currentProgram().endTransaction(txId, success);
+            }
+            String perms = "";
+            if (block.isRead()) perms += "R";
+            if (block.isWrite()) perms += "W";
+            if (block.isExecute()) perms += "X";
+            if (success) {
+                Msg.info(this, "[MCP] SET PERMS " + block.getName() + " = " + perms);
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            sb.append(jp("success", success)).append(", ");
+            sb.append(jp("block", block.getName())).append(", ");
+            sb.append(jp("start", formatAddr(block.getStart()))).append(", ");
+            sb.append(jp("end", formatAddr(block.getEnd()))).append(", ");
+            sb.append(jp("perms", perms));
+            sb.append("}");
+            return sb.toString();
+        });
+        respond(ex, json);
+    }
+
+    // POST /analyze_range ------------------------------------------------
+    //
+    // Body: {"start": "<hex>", "end": "<hex>"}
+    //
+    // Forces disassembly + auto-analysis over [start, end]. Use after
+    // /set_segment_perms to get functions detected in a newly-executable
+    // segment. Long-running on large ranges (analysis can take minutes).
+
+    private void handleAnalyzeRange(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String startStr = body.get("start");
+        String endStr = body.get("end");
+        if (startStr == null || endStr == null) {
+            respondError(ex, "Provide 'start' and 'end'", 400);
+            return;
+        }
+        String json = onSwing(() -> {
+            Address start = parseAddress(startStr);
+            Address end = parseAddress(endStr);
+            if (start == null || end == null) {
+                return "{" + jp("success", false) + ", " +
+                       jp("error", "Invalid address") + "}";
+            }
+            boolean success = false;
+            long byteCount = 0;
+            int txId = currentProgram().startTransaction("MCP Analyze Range");
+            try {
+                AddressSet set = new AddressSet(start, end);
+                DisassembleCommand cmd =
+                    new DisassembleCommand(set, null, true);
+                cmd.applyTo(currentProgram(), TaskMonitor.DUMMY);
+                AutoAnalysisManager mgr =
+                    AutoAnalysisManager.getAnalysisManager(currentProgram());
+                if (mgr != null) {
+                    mgr.startAnalysis(TaskMonitor.DUMMY);
+                    mgr.waitForAnalysis(null, TaskMonitor.DUMMY);
+                }
+                byteCount = set.getNumAddresses();
+                success = true;
+            } catch (Exception e) {
+                Msg.error(this, "[MCP] ANALYZE RANGE FAILED", e);
+            } finally {
+                currentProgram().endTransaction(txId, success);
+            }
+            if (success) {
+                Msg.info(this, "[MCP] ANALYZE RANGE " + formatAddr(start) +
+                    "-" + formatAddr(end) + " (" + byteCount + " bytes)");
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            sb.append(jp("success", success)).append(", ");
+            sb.append(jp("start", formatAddr(start))).append(", ");
+            sb.append(jp("end", formatAddr(end))).append(", ");
+            sb.append(jp("bytes", byteCount));
+            sb.append("}");
+            return sb.toString();
+        });
+        respond(ex, json);
+    }
+
+    // POST /search_strings -----------------------------------------------
+    // Body: {"pattern": "<substring>"}  (case-insensitive, max 100)
+
+    private void handleSearchStrings(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String pattern = body.get("pattern");
+        if (pattern == null) {
+            respondError(ex, "Provide 'pattern'", 400);
+            return;
+        }
+        String json = onSwing(() -> {
+            String patternLower = pattern.toLowerCase();
+            List<String> results = new ArrayList<>();
+            int count = 0;
+            DataIterator dataIter = currentProgram().getListing().getDefinedData(true);
+            while (dataIter.hasNext() && count < 100) {
+                Data data = dataIter.next();
+                if (!data.hasStringValue()) continue;
+                String value = data.getDefaultValueRepresentation();
+                if (value == null) continue;
+                if (value.startsWith("\"") && value.endsWith("\"")) {
+                    value = value.substring(1, value.length() - 1);
+                }
+                if (!value.toLowerCase().contains(patternLower)) continue;
+                StringBuilder entry = new StringBuilder();
+                entry.append("{");
+                entry.append(jp("address", formatAddr(data.getAddress()))).append(", ");
+                entry.append(jp("value", value)).append(", ");
+                entry.append(jp("length", data.getLength()));
+                entry.append("}");
+                results.add(entry.toString());
+                count++;
+            }
+            return "{\"strings\": [" + String.join(", ", results) + "]}";
+        });
+        respond(ex, json);
+    }
+
+    // POST /xrefs_to -----------------------------------------------------
+    // Body: {"address": "<hex>"} OR {"name": "<func name>"}
+
+    private void handleXrefsTo(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String json = onSwing(() -> {
+            Address addr = null;
+            String addrStr = body.get("address");
+            String name = body.get("name");
+            if (addrStr != null && !addrStr.isEmpty()) {
+                addr = parseAddress(addrStr);
+            } else if (name != null && !name.isEmpty()) {
+                Function func = findFunctionByName(name);
+                if (func != null) addr = func.getEntryPoint();
+            }
+            if (addr == null) {
+                return "{" + jp("error", "Provide valid 'address' or 'name'") + "}";
+            }
+            ghidra.program.model.symbol.ReferenceIterator refsIter =
+                currentProgram().getReferenceManager().getReferencesTo(addr);
+            List<String> entries = new ArrayList<>();
+            while (refsIter.hasNext()) {
+                Reference ref = refsIter.next();
+                Function fromFunc = currentProgram().getListing()
+                    .getFunctionContaining(ref.getFromAddress());
+                String fromFuncName = fromFunc != null ? fromFunc.getName() : "";
+                StringBuilder entry = new StringBuilder();
+                entry.append("{");
+                entry.append(jp("from", formatAddr(ref.getFromAddress()))).append(", ");
+                entry.append(jp("from_func", fromFuncName)).append(", ");
+                entry.append(jp("type", ref.getReferenceType().getValue())).append(", ");
+                entry.append(jp("type_name", ref.getReferenceType().getName()));
+                entry.append("}");
+                entries.add(entry.toString());
+            }
+            return "{\"refs\": [" + String.join(", ", entries) + "]}";
+        });
+        respond(ex, json);
+    }
+
+    // POST /xrefs_from ---------------------------------------------------
+
+    private void handleXrefsFrom(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String addrStr = body.get("address");
+        if (addrStr == null || addrStr.isEmpty()) {
+            respondError(ex, "Provide 'address'", 400);
+            return;
+        }
+        String json = onSwing(() -> {
+            Address addr = parseAddress(addrStr);
+            if (addr == null) {
+                return "{" + jp("error", "Invalid address") + "}";
+            }
+            Reference[] refs = currentProgram().getReferenceManager().getReferencesFrom(addr);
+            List<String> entries = new ArrayList<>();
+            for (Reference ref : refs) {
+                Address toAddr = ref.getToAddress();
+                Symbol sym = currentProgram().getSymbolTable().getPrimarySymbol(toAddr);
+                String symName = sym != null ? sym.getName() : "";
+                StringBuilder entry = new StringBuilder();
+                entry.append("{");
+                entry.append(jp("to", formatAddr(toAddr))).append(", ");
+                entry.append(jp("name", symName)).append(", ");
+                entry.append(jp("type", ref.getReferenceType().getValue())).append(", ");
+                entry.append(jp("type_name", ref.getReferenceType().getName()));
+                entry.append("}");
+                entries.add(entry.toString());
+            }
+            return "{\"refs\": [" + String.join(", ", entries) + "]}";
+        });
+        respond(ex, json);
+    }
+
+    // POST /callers ------------------------------------------------------
+    // Body: {"address": "<hex>"} OR {"name": "<func name>"}
+    // Returns unique functions that call the target.
+
+    private void handleCallers(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String json = onSwing(() -> {
+            Function func = resolveFunction(body);
+            if (func == null) {
+                return "{" + jp("error", "Function not found") + "}";
+            }
+            Set<String> seen = new LinkedHashSet<>();
+            List<String> entries = new ArrayList<>();
+            ghidra.program.model.symbol.ReferenceIterator refsIter =
+                currentProgram().getReferenceManager()
+                    .getReferencesTo(func.getEntryPoint());
+            while (refsIter.hasNext()) {
+                Reference ref = refsIter.next();
+                if (!ref.getReferenceType().isCall() &&
+                    !ref.getReferenceType().isJump()) continue;
+                Function caller = currentProgram().getListing()
+                    .getFunctionContaining(ref.getFromAddress());
+                if (caller == null) continue;
+                if (caller.getEntryPoint().equals(func.getEntryPoint())) continue;
+                String key = formatAddr(caller.getEntryPoint());
+                if (!seen.add(key)) continue;
+                StringBuilder entry = new StringBuilder();
+                entry.append("{");
+                entry.append(jp("address", key)).append(", ");
+                entry.append(jp("name", caller.getName())).append(", ");
+                entry.append(jp("call_site", formatAddr(ref.getFromAddress())));
+                entry.append("}");
+                entries.add(entry.toString());
+            }
+            return "{\"callers\": [" + String.join(", ", entries) + "]}";
+        });
+        respond(ex, json);
+    }
+
+    // POST /callees ------------------------------------------------------
+
+    private void handleCallees(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String json = onSwing(() -> {
+            Function func = resolveFunction(body);
+            if (func == null) {
+                return "{" + jp("error", "Function not found") + "}";
+            }
+            Set<String> seen = new LinkedHashSet<>();
+            List<String> entries = new ArrayList<>();
+            Listing listing = currentProgram().getListing();
+            InstructionIterator instructions =
+                listing.getInstructions(func.getBody(), true);
+            while (instructions.hasNext()) {
+                Instruction instr = instructions.next();
+                Reference[] refs = currentProgram().getReferenceManager()
+                    .getReferencesFrom(instr.getAddress());
+                for (Reference ref : refs) {
+                    if (!ref.getReferenceType().isCall() &&
+                        !ref.getReferenceType().isJump()) continue;
+                    Function target = listing.getFunctionAt(ref.getToAddress());
+                    if (target == null) {
+                        target = listing.getFunctionContaining(ref.getToAddress());
+                    }
+                    if (target == null) continue;
+                    if (target.getEntryPoint().equals(func.getEntryPoint())) continue;
+                    String key = formatAddr(target.getEntryPoint());
+                    if (!seen.add(key)) continue;
+                    StringBuilder entry = new StringBuilder();
+                    entry.append("{");
+                    entry.append(jp("address", key)).append(", ");
+                    entry.append(jp("name", target.getName()));
+                    entry.append("}");
+                    entries.add(entry.toString());
+                }
+            }
+            return "{\"callees\": [" + String.join(", ", entries) + "]}";
+        });
+        respond(ex, json);
+    }
+
+    // POST /bytes --------------------------------------------------------
+    // Body: {"address": "<hex>", "size": <int, max 4096>}
+
+    private void handleBytes(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String addrStr = body.get("address");
+        String sizeStr = body.get("size");
+        if (addrStr == null || addrStr.isEmpty()) {
+            respondError(ex, "Provide 'address'", 400);
+            return;
+        }
+        int requested = 256;
+        if (sizeStr != null && !sizeStr.isEmpty()) {
+            try { requested = Integer.parseInt(sizeStr); }
+            catch (NumberFormatException ignored) {}
+        }
+        final int sz = Math.min(Math.max(requested, 1), 4096);
+        String json = onSwing(() -> {
+            Address addr = parseAddress(addrStr);
+            if (addr == null) {
+                return "{" + jp("error", "Invalid address") + "}";
+            }
+            byte[] buf = new byte[sz];
+            int read;
+            try {
+                read = currentProgram().getMemory().getBytes(addr, buf);
+            } catch (Exception e) {
+                return "{" + jp("error",
+                    "Cannot read bytes at address: " + e.getMessage()) + "}";
+            }
+            byte[] actual = buf;
+            if (read < sz) {
+                actual = new byte[read];
+                System.arraycopy(buf, 0, actual, 0, read);
+            }
+            StringBuilder hex = new StringBuilder();
+            for (byte b : actual) hex.append(String.format("%02x", b & 0xFF));
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            sb.append(jp("address", formatAddr(addr))).append(", ");
+            sb.append(jp("size", actual.length)).append(", ");
+            sb.append(jp("hex", hex.toString()));
+            sb.append("}");
+            return sb.toString();
+        });
+        respond(ex, json);
+    }
+
+    // POST /create_function ----------------------------------------------
+    // Body: {"address": "<hex>", "end": "<hex>"?}
+    // Forces Ghidra to define a function at the given address. Useful for
+    // regions where auto-analysis missed the boundary.
+
+    private void handleCreateFunction(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String addrStr = body.get("address");
+        String endStr = body.get("end");
+        if (addrStr == null || addrStr.isEmpty()) {
+            respondError(ex, "Provide 'address'", 400);
+            return;
+        }
+        String json = onSwing(() -> {
+            Address addr = parseAddress(addrStr);
+            if (addr == null) {
+                return "{" + jp("success", false) + ", " +
+                       jp("error", "Invalid address") + "}";
+            }
+            Address end = (endStr != null && !endStr.isEmpty())
+                ? parseAddress(endStr) : null;
+            boolean success = false;
+            Function func = null;
+            int txId = currentProgram().startTransaction("MCP Create Function");
+            try {
+                if (end != null) {
+                    AddressSet bodySet = new AddressSet(addr, end);
+                    func = currentProgram().getListing().createFunction(
+                        null, addr, bodySet,
+                        ghidra.program.model.symbol.SourceType.USER_DEFINED);
+                } else {
+                    ghidra.app.cmd.function.CreateFunctionCmd cmd =
+                        new ghidra.app.cmd.function.CreateFunctionCmd(addr);
+                    cmd.applyTo(currentProgram(), TaskMonitor.DUMMY);
+                    func = currentProgram().getListing().getFunctionAt(addr);
+                }
+                success = (func != null);
+            } catch (Exception e) {
+                Msg.error(this, "[MCP] CREATE FUNC FAILED " + formatAddr(addr), e);
+            } finally {
+                currentProgram().endTransaction(txId, success);
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            sb.append(jp("success", success)).append(", ");
+            sb.append(jp("address", formatAddr(addr)));
+            if (func != null) {
+                sb.append(", ");
+                sb.append(jp("name", func.getName())).append(", ");
+                sb.append(jp("size", func.getBody().getNumAddresses()));
+            }
+            if (!success) {
+                sb.append(", ");
+                sb.append(jp("error", "create_function failed"));
+            }
+            sb.append("}");
+            return sb.toString();
+        });
+        respond(ex, json);
+    }
+
+    // POST /exec_script ---------------------------------------------------
+    // Body: {"code": "<jython source>", "commit": "true|false"}
+    //
+    // Executes user-supplied Jython 2.7 code against the currently-loaded
+    // program.  Globals pre-populated:
+    //     currentProgram = the active Program
+    //     monitor        = TaskMonitor.DUMMY
+    //     fpapi          = FlatProgramAPI(currentProgram)
+    // and these modules are wildcard-imported:
+    //     ghidra.program.flatapi
+    //     ghidra.program.model.address / .listing / .symbol / .mem / .scalar
+    //     ghidra.util.task (TaskMonitor)
+    //
+    // print() output is captured and returned in the "stdout" field.
+    // If commit=true (default), the script runs inside a database
+    // transaction so it may safely call rename/addComment/etc.  Set
+    // commit=false for read-only analysis scripts (faster, can't dirty
+    // the DB on a script bug).
+    //
+    // Use this when the dedicated endpoints aren't expressive enough --
+    // bulk vtable resolution, custom xref hunts, struct field mapping,
+    // mass-decoration scans, etc.
+
+    private void handleExecScript(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String code = body.get("code");
+        if (code == null || code.isEmpty()) {
+            respondError(ex, "Provide 'code'", 400);
+            return;
+        }
+        boolean commit = !"false".equalsIgnoreCase(body.get("commit"));
+        String json = onSwing(() -> {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            PrintStream ps;
+            try {
+                ps = new PrintStream(baos, true, "UTF-8");
+            } catch (UnsupportedEncodingException u) {
+                ps = new PrintStream(baos, true);
+            }
+            String error = null;
+            boolean success = false;
+            int txId = -1;
+            if (commit) {
+                txId = currentProgram().startTransaction("MCP Exec Script");
+            }
+            try {
+                org.python.util.PythonInterpreter interp =
+                    new org.python.util.PythonInterpreter();
+                try {
+                    interp.setOut(ps);
+                    interp.setErr(ps);
+                    interp.set("currentProgram", currentProgram());
+                    interp.set("monitor", TaskMonitor.DUMMY);
+                    interp.exec(
+                        "from ghidra.program.flatapi import FlatProgramAPI\n" +
+                        "from ghidra.program.model.address import *\n" +
+                        "from ghidra.program.model.listing import *\n" +
+                        "from ghidra.program.model.symbol import *\n" +
+                        "from ghidra.program.model.mem import *\n" +
+                        "from ghidra.program.model.scalar import *\n" +
+                        "from ghidra.util.task import TaskMonitor\n" +
+                        "fpapi = FlatProgramAPI(currentProgram)\n");
+                    interp.exec(code);
+                    ps.flush();
+                    success = true;
+                } finally {
+                    try { interp.close(); } catch (Throwable ignored) {}
+                }
+            } catch (Throwable t) {
+                ps.flush();
+                String msg = t.getMessage();
+                error = t.getClass().getSimpleName() + ": " +
+                        (msg != null ? msg : "(no message)");
+                Msg.error(this, "[MCP] EXEC SCRIPT FAILED", t);
+            } finally {
+                if (commit) {
+                    currentProgram().endTransaction(txId, success);
+                }
+            }
+            String stdout;
+            try {
+                stdout = baos.toString("UTF-8");
+            } catch (UnsupportedEncodingException u) {
+                stdout = baos.toString();
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            sb.append(jp("success", success)).append(", ");
+            sb.append(jp("committed", commit)).append(", ");
+            sb.append(jp("stdout", stdout));
+            if (error != null) {
+                sb.append(", ").append(jp("error", error));
+            }
             sb.append("}");
             return sb.toString();
         });
