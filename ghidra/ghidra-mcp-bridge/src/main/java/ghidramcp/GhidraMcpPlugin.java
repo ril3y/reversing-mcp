@@ -14,10 +14,13 @@ import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 
 import ghidra.MiscellaneousPluginPackage;
+import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileOptions;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.plugin.ProgramPlugin;
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
+import ghidra.program.model.address.AddressSet;
 import ghidra.framework.plugintool.PluginInfo;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.framework.plugintool.util.PluginStatus;
@@ -166,6 +169,8 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             server.createContext("/search_functions", wrap(this::handleSearchFunctions));
             server.createContext("/rename", wrap(this::handleRename));
             server.createContext("/comment", wrap(this::handleComment));
+            server.createContext("/set_segment_perms", wrap(this::handleSetSegmentPerms));
+            server.createContext("/analyze_range", wrap(this::handleAnalyzeRange));
 
             server.start();
 
@@ -851,6 +856,134 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             sb.append("{");
             sb.append(jp("success", success)).append(", ");
             sb.append(jp("address", formatAddr(addr)));
+            sb.append("}");
+            return sb.toString();
+        });
+        respond(ex, json);
+    }
+
+    // POST /set_segment_perms --------------------------------------------
+    //
+    // Body: {"address": "<hex>", "perms": "RX" | "RWX" | "R" | ...}
+    //
+    // Flips R/W/X bits on the MemoryBlock containing `address`. Returns the
+    // resulting perms so callers can verify. Useful when Ghidra mis-loaded a
+    // LOAD-RX segment as data-only.
+
+    private void handleSetSegmentPerms(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String addrStr = body.get("address");
+        String permStr = body.get("perms");
+        if (addrStr == null || addrStr.isEmpty()) {
+            respondError(ex, "Provide 'address'", 400);
+            return;
+        }
+        if (permStr == null) {
+            respondError(ex, "Provide 'perms' (e.g. 'RX')", 400);
+            return;
+        }
+        String json = onSwing(() -> {
+            Address addr = parseAddress(addrStr);
+            if (addr == null) {
+                return "{" + jp("success", false) + ", " +
+                       jp("error", "Invalid address") + "}";
+            }
+            MemoryBlock block = activeProgram.getMemory().getBlock(addr);
+            if (block == null) {
+                return "{" + jp("success", false) + ", " +
+                       jp("error", "No memory block at " + formatAddr(addr)) +
+                       "}";
+            }
+            String pU = permStr.toUpperCase();
+            boolean wantR = pU.contains("R");
+            boolean wantW = pU.contains("W");
+            boolean wantX = pU.contains("X");
+            boolean success = false;
+            int txId = activeProgram.startTransaction("MCP Set Block Perms");
+            try {
+                block.setRead(wantR);
+                block.setWrite(wantW);
+                block.setExecute(wantX);
+                success = true;
+            } catch (Exception e) {
+                Msg.error(this, "[MCP] SET PERMS FAILED " + block.getName(), e);
+            } finally {
+                activeProgram.endTransaction(txId, success);
+            }
+            String perms = "";
+            if (block.isRead()) perms += "R";
+            if (block.isWrite()) perms += "W";
+            if (block.isExecute()) perms += "X";
+            if (success) {
+                Msg.info(this, "[MCP] SET PERMS " + block.getName() + " = " + perms);
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            sb.append(jp("success", success)).append(", ");
+            sb.append(jp("block", block.getName())).append(", ");
+            sb.append(jp("start", formatAddr(block.getStart()))).append(", ");
+            sb.append(jp("end", formatAddr(block.getEnd()))).append(", ");
+            sb.append(jp("perms", perms));
+            sb.append("}");
+            return sb.toString();
+        });
+        respond(ex, json);
+    }
+
+    // POST /analyze_range ------------------------------------------------
+    //
+    // Body: {"start": "<hex>", "end": "<hex>"}
+    //
+    // Forces disassembly + auto-analysis over [start, end]. Use after
+    // /set_segment_perms to get functions detected in a newly-executable
+    // segment. Long-running on large ranges (analysis can take minutes).
+
+    private void handleAnalyzeRange(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String startStr = body.get("start");
+        String endStr = body.get("end");
+        if (startStr == null || endStr == null) {
+            respondError(ex, "Provide 'start' and 'end'", 400);
+            return;
+        }
+        String json = onSwing(() -> {
+            Address start = parseAddress(startStr);
+            Address end = parseAddress(endStr);
+            if (start == null || end == null) {
+                return "{" + jp("success", false) + ", " +
+                       jp("error", "Invalid address") + "}";
+            }
+            boolean success = false;
+            long byteCount = 0;
+            int txId = activeProgram.startTransaction("MCP Analyze Range");
+            try {
+                AddressSet set = new AddressSet(start, end);
+                DisassembleCommand cmd =
+                    new DisassembleCommand(set, null, true);
+                cmd.applyTo(activeProgram, TaskMonitor.DUMMY);
+                AutoAnalysisManager mgr =
+                    AutoAnalysisManager.getAnalysisManager(activeProgram);
+                if (mgr != null) {
+                    mgr.startAnalysis(TaskMonitor.DUMMY);
+                    mgr.waitForAnalysis(null, TaskMonitor.DUMMY);
+                }
+                byteCount = set.getNumAddresses();
+                success = true;
+            } catch (Exception e) {
+                Msg.error(this, "[MCP] ANALYZE RANGE FAILED", e);
+            } finally {
+                activeProgram.endTransaction(txId, success);
+            }
+            if (success) {
+                Msg.info(this, "[MCP] ANALYZE RANGE " + formatAddr(start) +
+                    "-" + formatAddr(end) + " (" + byteCount + " bytes)");
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            sb.append(jp("success", success)).append(", ");
+            sb.append(jp("start", formatAddr(start))).append(", ");
+            sb.append(jp("end", formatAddr(end))).append(", ");
+            sb.append(jp("bytes", byteCount));
             sb.append("}");
             return sb.toString();
         });

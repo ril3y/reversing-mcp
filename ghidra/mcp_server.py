@@ -23,9 +23,25 @@ NAME_KEYS = ("program", "program_path")
 mcp = FastMCP("ghidra")
 
 
+# Per-endpoint timeouts. Ghidra operations vary wildly in cost:
+# fast lookups (info, function, segments) finish in <1s; analysis-touching ones
+# (create_function, decompile, analyze_range) can run minutes on large segments.
+# Anything not in this map falls back to DEFAULT_TIMEOUT.
+DEFAULT_TIMEOUT = 60
+ENDPOINT_TIMEOUTS = {
+    "/decompile": 180,
+    "/create_function": 180,
+    "/analyze_range": 600,
+    "/set_segment_perms": 30,
+    "/search_functions": 60,
+    "/search_strings": 60,
+}
+
+
 def _call(endpoint, body=None, program=None):
+    timeout = ENDPOINT_TIMEOUTS.get(endpoint, DEFAULT_TIMEOUT)
     return call_instance(REG_DIR, endpoint, body, target=program,
-                         tool_name=TOOL, name_keys=NAME_KEYS, timeout=60)
+                         tool_name=TOOL, name_keys=NAME_KEYS, timeout=timeout)
 
 
 @mcp.tool()
@@ -241,6 +257,44 @@ def delete_function(address: str, program: str = "") -> dict:
         program: Program name substring to target (optional)
     """
     return _call("/delete_function", {"address": address}, program=program or None)
+
+
+@mcp.tool()
+def set_segment_perms(address: str, perms: str, program: str = "") -> dict:
+    """Set read/write/execute permissions on the memory block containing an
+    address. Use this when a code segment was loaded as data-only (e.g., Ghidra
+    sometimes marks ARM ELF LOAD-RX segments as just R, preventing auto-analysis).
+
+    After flipping permissions, call analyze_range over the segment to force
+    disassembly + function discovery.
+
+    Args:
+        address: Any address inside the target memory block (hex).
+        perms: Permission string e.g. 'RX' / 'RWX' / 'R'. Letters are matched
+            case-insensitively; missing letters clear that bit.
+        program: Program name substring to target (optional).
+    """
+    return _call("/set_segment_perms",
+                 {"address": address, "perms": perms},
+                 program=program or None)
+
+
+@mcp.tool()
+def analyze_range(start: str, end: str, program: str = "") -> dict:
+    """Force disassembly + auto-analysis over a byte range. Useful after
+    flipping a segment to executable, or when Ghidra missed a code region.
+
+    Long-running on large segments (analysis can take several minutes); this
+    endpoint has a 10-minute server-side timeout.
+
+    Args:
+        start: Start address (hex, inclusive).
+        end: End address (hex, inclusive).
+        program: Program name substring to target (optional).
+    """
+    return _call("/analyze_range",
+                 {"start": start, "end": end},
+                 program=program or None)
 
 
 if __name__ == "__main__":
