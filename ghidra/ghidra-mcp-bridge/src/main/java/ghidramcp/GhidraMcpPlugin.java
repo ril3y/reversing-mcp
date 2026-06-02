@@ -80,6 +80,22 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     private final ThreadLocal<Program> threadProgram = new ThreadLocal<>();
 
     /**
+     * Per-request parsed body. Set in wrap() before dispatch, cleared in the
+     * finally block. We CANNOT cache on the HttpExchange via setAttribute()
+     * because the JDK's sun.net.httpserver stores exchange attributes on the
+     * shared HttpContext (NOT on the exchange itself) — that caused every
+     * subsequent request to a given endpoint to see the FIRST request's body.
+     * That single mis-attribution was the root cause of:
+     *   - exec_script returning the first call's stdout every time
+     *   - search_strings ignoring the second pattern
+     *   - decompile returning the wrong function on second-call addresses
+     * Since each HTTP request is fully handled on one worker thread before
+     * the thread accepts another request, a ThreadLocal cleared in
+     * wrap()'s finally is the right scope.
+     */
+    private static final ThreadLocal<Map<String, String>> threadBody = new ThreadLocal<>();
+
+    /**
      * The Program a handler should target on this request. If the body
      * carried a "program" field (set by wrap), returns that program; else
      * falls back to the active (last-opened) program.
@@ -389,16 +405,15 @@ public class GhidraMcpPlugin extends ProgramPlugin {
 
     private static Map<String, String> parseJsonBody(HttpExchange exchange)
             throws IOException {
-        // Cache the parsed body on the exchange so wrap() can pre-parse it
-        // for program-resolution, and the handler can re-parse without losing
-        // the InputStream (which is consumable once).
-        @SuppressWarnings("unchecked")
-        Map<String, String> cached = (Map<String, String>) exchange.getAttribute("mcp_parsed_body");
+        // First check the per-request ThreadLocal that wrap() populates.
+        // (Don't use HttpExchange.setAttribute — see threadBody javadoc:
+        //  attributes leak through the shared HttpContext.)
+        Map<String, String> cached = threadBody.get();
         if (cached != null) {
             return cached;
         }
         Map<String, String> result = new LinkedHashMap<>();
-        exchange.setAttribute("mcp_parsed_body", result);
+        threadBody.set(result);
         if (!"POST".equals(exchange.getRequestMethod())) {
             return result;
         }
@@ -413,7 +428,11 @@ public class GhidraMcpPlugin extends ProgramPlugin {
         if (!body.startsWith("{")) {
             return result;
         }
-        body = body.substring(1, body.lastIndexOf('}'));
+        int lastBrace = body.lastIndexOf('}');
+        if (lastBrace <= 0) {
+            return result;
+        }
+        body = body.substring(1, lastBrace);
 
         int i = 0;
         while (i < body.length()) {
@@ -555,9 +574,16 @@ public class GhidraMcpPlugin extends ProgramPlugin {
     private HttpHandler wrap(EndpointHandler handler) {
         return exchange -> {
             try {
-                // Pre-parse body so we can resolve which Program to target
-                // (handlers can call parseJsonBody again -- result is cached
-                //  on the exchange attributes so it costs nothing).
+                // Pre-parse body so we can resolve which Program to target.
+                // parseJsonBody stashes the result in threadBody so the
+                // handler can call parseJsonBody again without re-reading
+                // the (already-consumed) request InputStream.
+                //
+                // CRITICAL: ALWAYS clear threadBody in finally, regardless
+                // of whether resolveProgram returned a target. HTTP worker
+                // threads are reused across requests, and a stale body left
+                // in the ThreadLocal would be served to the NEXT request on
+                // the same thread.
                 Map<String, String> body = parseJsonBody(exchange);
                 Program target = resolveProgram(body);
                 if (target != null) {
@@ -567,6 +593,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                     handler.handle(exchange);
                 } finally {
                     threadProgram.remove();
+                    threadBody.remove();
                 }
             } catch (InvocationTargetException e) {
                 Throwable cause = e.getCause();
@@ -578,6 +605,12 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 Msg.error(GhidraMcpPlugin.this, "[MCP] Handler error", e);
                 respondError(exchange,
                     e.getClass().getSimpleName() + ": " + e.getMessage(), 500);
+            } finally {
+                // Belt-and-suspenders: ensure ThreadLocals are cleared even
+                // if respondError throws (e.g. closed socket). The inner
+                // finally above already does this for the success path.
+                threadProgram.remove();
+                threadBody.remove();
             }
         };
     }
@@ -1470,9 +1503,24 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                 txId = currentProgram().startTransaction("MCP Exec Script");
             }
             try {
+                // Defensive: give each call its OWN PySystemState. The no-arg
+                // `new PythonInterpreter()` binds to Jython's PROCESS-WIDE
+                // default PySystemState, so `interp.setOut(ps)` mutates a
+                // shared global. The primary stdout-duplication bug was the
+                // parseJsonBody attribute-cache leak (see threadBody javadoc),
+                // but isolating the Jython state per call removes a second
+                // potential cross-call leak and makes concurrent exec_script
+                // calls (if we ever allow them) safe.
+                org.python.core.PySystemState pySys =
+                    new org.python.core.PySystemState();
                 org.python.util.PythonInterpreter interp =
-                    new org.python.util.PythonInterpreter();
+                    new org.python.util.PythonInterpreter(null, pySys);
                 try {
+                    // Route the per-call PySystemState's stdout/stderr at our
+                    // capture stream. PythonInterpreter.setOut(PrintStream)
+                    // wraps the stream in a PyFile and assigns it to
+                    // systemState.stdout (= our isolated pySys), so user
+                    // print() statements land in `baos`.
                     interp.setOut(ps);
                     interp.setErr(ps);
                     interp.set("currentProgram", currentProgram());
@@ -1490,6 +1538,8 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                     ps.flush();
                     success = true;
                 } finally {
+                    // interp.close() releases the locals dict and unhooks
+                    // pySys from the thread state, allowing both to be GC'd.
                     try { interp.close(); } catch (Throwable ignored) {}
                 }
             } catch (Throwable t) {
