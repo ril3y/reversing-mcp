@@ -291,20 +291,21 @@ def find_micromips_prologues(idb: str = "") -> dict:
 
 @mcp.tool()
 def open_file(local_path: str, remote_filename: str = "", spawn: bool = True, idb: str = "") -> dict:
-    """Upload a local binary to the remote IDA machine and optionally open it in a new IDA instance.
+    """Upload a local binary to the remote IDA machine and open it in a new IDA instance.
 
-    The file is base64-encoded and sent to the remote plugin, which saves it to
-    ~/.ida_mcp/uploads/<filename>. When spawn=True (default), a new IDA process
-    opens the file automatically. After auto-analysis completes, use --scan or
-    list_instances() to discover the new instance's port.
+    The file is base64-encoded and POSTed to /upload. Two receivers are tried in order:
 
-    Works for both local and remote modes. In local mode the file is copied to
-    ~/.ida_mcp/uploads/ without needing a network transfer.
+    1. An existing IDA plugin instance (port 13337+) — works when IDA is already open.
+    2. The standalone spawn server (port 13336) — works when NO IDA is open yet.
+       Run  `python ida/spawn_server.py`  on the remote machine once to enable this.
+
+    After IDA opens and finishes auto-analysis, run --scan to find the new port,
+    then reconnect with --remote host:new_port.
 
     Args:
-        local_path: Path to the binary on this machine
-        remote_filename: Filename to use on the remote side (default: basename of local_path)
-        spawn: If True (default), launch a new IDA instance on the uploaded file
+        local_path: Path to the binary on THIS machine
+        remote_filename: Filename to use on the remote (default: basename of local_path)
+        spawn: If True (default), launch a new IDA process on the uploaded file
         idb: IDB substring to target a specific instance (optional)
     """
     import base64
@@ -315,8 +316,39 @@ def open_file(local_path: str, remote_filename: str = "", spawn: bool = True, id
             data_b64 = base64.b64encode(f.read()).decode()
     except OSError as e:
         return {"error": f"Cannot read {local_path}: {e}"}
-    return _call("/upload", {"filename": fname, "data": data_b64, "spawn": spawn},
-                 idb=idb or None, timeout=120)
+
+    body = {"filename": fname, "data": data_b64, "spawn": spawn}
+
+    # Try existing IDA plugin first
+    result = _call("/upload", body, idb=idb or None, timeout=120)
+    if "error" not in result:
+        return result
+
+    # Fall back to standalone spawn server on port 13336
+    if REMOTE:
+        host = REMOTE.split(":")[0]
+        spawn_target = f"{host}:13336"
+    else:
+        spawn_target = None
+
+    if spawn_target:
+        fallback = call_remote(spawn_target, "/upload", body, timeout=120)
+        if "error" not in fallback:
+            fallback["note"] = (
+                (fallback.get("note") or "") +
+                " (via spawn_server on port 13336)"
+            )
+            return fallback
+        return {
+            "error": (
+                f"No IDA instance found and spawn server unreachable at {spawn_target}. "
+                "Run `python ida/spawn_server.py` on the remote machine first."
+            ),
+            "ida_error": result.get("error"),
+            "spawn_error": fallback.get("error"),
+        }
+
+    return result
 
 
 @mcp.tool()
