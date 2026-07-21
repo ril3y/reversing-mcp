@@ -80,10 +80,16 @@ def _spawn(ida_bin: str, file_path: str, headless: bool = False) -> dict:
     else:
         cmd = [ida_bin, file_path]
 
+    # Always bind to all interfaces so the MCP plugin is reachable remotely.
+    env = {**os.environ, "IDA_MCP_BIND": "0.0.0.0"}
+
     if sys.platform == "win32":
-        kwargs = {"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+        kwargs = {
+            "creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            "env": env,
+        }
     else:
-        kwargs = {"start_new_session": True, "close_fds": True}
+        kwargs = {"start_new_session": True, "close_fds": True, "env": env}
 
     proc = subprocess.Popen(cmd, **kwargs)
     return {"pid": proc.pid, "ida_bin": ida_bin, "file": file_path, "headless": headless}
