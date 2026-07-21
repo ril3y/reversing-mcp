@@ -57,6 +57,13 @@ MAX_PORT = 13400
 # Set IDA_MCP_BIND=0.0.0.0 on the remote machine to allow network connections.
 BIND_HOST = os.environ.get("IDA_MCP_BIND", "127.0.0.1")
 
+# Headless mode: idat / idat64 (text UI) rather than ida / ida64 (GUI).
+# register_timer does not fire without the Qt event loop, so in headless
+# mode we route every request through execute_sync instead.
+try:
+    _HEADLESS = not ida_kernwin.is_idaq()
+except Exception:
+    _HEADLESS = False
 
 _request_queue = []
 _request_lock = threading.Lock()
@@ -65,42 +72,54 @@ _request_lock = threading.Lock()
 def _run_on_main_thread(func, *args, **kwargs):
     """Execute a function on IDA's main thread and return its result.
 
-    IDA's API is not thread-safe -- all ida_*/idc/idautils calls must
-    run on the main thread. The HTTP server runs in a background thread.
+    GUI mode: queue + UI timer (register_timer fires every 100 ms).
+    Headless mode: execute_sync (works in idat without the Qt event loop).
 
-    We put work on a queue and a UI timer drains it on the main thread.
-    The HTTP handler thread blocks on an Event until the result is ready.
-    This never deadlocks because we never call execute_sync.
-
-    If the request stays queued for >5 s we log a warning to IDA's
-    Output window — common causes:
-      - a modal dialog blocking the main thread (Hex-Rays warning,
-        "save changes?", "type already exists, overwrite?")
-      - a previous Hex-Rays call chewing on an obfuscated function
-      - the viewer's QTimer doing slow work (e.g. live decompile macros)
-    idc.batch(1) wrapping in _MainThreadTimer._tick suppresses dialogs,
-    but the other two cases are visible as queue-wait warnings.
-
-    The label argument (if provided in kwargs as `_mcp_label`) is included
-    in the warning so the user can identify which request stalled.
+    In GUI mode, if the request stays queued for >5 s a warning is printed —
+    common causes: modal dialog, slow Hex-Rays call, viewer macro decompile.
     """
     label = kwargs.pop("_mcp_label", None) or getattr(func, "__name__", repr(func))
 
+    if _HEADLESS:
+        # execute_sync blocks the calling (background) thread until the
+        # function has run on the main thread — exactly what we need.
+        result = [None]
+        error  = [None]
+
+        def _thunk():
+            prev = 0
+            try:
+                prev = idc.batch(1)
+                result[0] = func(*args, **kwargs)
+            except Exception as e:
+                error[0] = e
+            finally:
+                try:
+                    idc.batch(prev)
+                except Exception:
+                    pass
+            return 0  # execute_sync expects an int
+
+        ida_kernwin.execute_sync(_thunk, ida_kernwin.MFF_FAST)
+        if error[0] is not None:
+            raise error[0]
+        return result[0]
+
+    # GUI mode — original queue + timer path
     result = [None]
-    error = [None]
-    done = threading.Event()
+    error  = [None]
+    done   = threading.Event()
 
     item = (func, args, kwargs, result, error, done)
     with _request_lock:
         _request_queue.append(item)
 
-    # Wait for the timer to process our request; surface a warning after 5s.
     if not done.wait(timeout=5.0):
         ida_kernwin.msg(
             f"[MCP] WARNING: '{label}' queued for >5s — main thread busy "
             f"(modal dialog? slow Hex-Rays call? viewer macro decompile?).\n"
         )
-        done.wait()  # block until the timer fires
+        done.wait()
 
     if error[0] is not None:
         raise error[0]
@@ -2606,15 +2625,18 @@ def _register_notebook_action():
 
 
 def start_server():
-    """Start the HTTP server and main-thread timer."""
+    """Start the HTTP server and main-thread dispatcher."""
     global _server, _thread, _reg_path, _ui_timer
 
     if _server is not None:
         print(f"[MCP] Server already running on port {_server.server_port}")
         return
 
-    # Start the UI timer that processes requests on the main thread
-    _ui_timer = _MainThreadTimer(interval_ms=100)
+    if _HEADLESS:
+        # Headless: execute_sync handles dispatch — no timer needed.
+        print("[MCP] Headless mode: using execute_sync dispatch (no UI timer)")
+    else:
+        _ui_timer = _MainThreadTimer(interval_ms=100)
 
     port = _find_free_port()
     _server = http.server.HTTPServer((BIND_HOST, port), MCPHandler)
@@ -2622,12 +2644,13 @@ def start_server():
     _thread.start()
     _reg_path = _register(port)
 
-    _register_notebook_action()
+    if not _HEADLESS:
+        _register_notebook_action()
+        print(f"[MCP] Notebook viewer hotkey: Ctrl+Shift+N")
 
     print(f"[MCP] Server started on http://{BIND_HOST}:{port}")
     print(f"[MCP] IDB: {_idb_name()}")
     print(f"[MCP] Registration: {_reg_path}")
-    print(f"[MCP] Notebook viewer hotkey: Ctrl+Shift+N")
 
 
 def stop_server():
