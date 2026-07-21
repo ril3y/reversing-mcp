@@ -54,6 +54,8 @@ def _xref_type_name(t):
 REGISTRATION_DIR = os.path.expanduser("~/.ida_mcp")
 BASE_PORT = 13337
 MAX_PORT = 13400
+# Set IDA_MCP_BIND=0.0.0.0 on the remote machine to allow network connections.
+BIND_HOST = os.environ.get("IDA_MCP_BIND", "127.0.0.1")
 
 
 _request_queue = []
@@ -157,7 +159,7 @@ def _find_free_port():
     for port in range(BASE_PORT, MAX_PORT):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", port))
+                s.bind((BIND_HOST, port))
                 return port
         except OSError:
             continue
@@ -388,19 +390,42 @@ def get_bytes_at(addr, size):
 
 
 def decompile_function(addr):
-    """Decompile a function using Hex-Rays (if available)."""
-    if not ida_hexrays.init_hexrays_plugin():
-        return {"error": "Hex-Rays not available"}
+    """Decompile a function using Hex-Rays (IDA 9.x compatible)."""
     try:
-        cfunc = ida_hexrays.decompile(addr)
+        hf = ida_hexrays.hexrays_failure_t()
+        cfunc = ida_hexrays.decompile(addr, hf)
         if cfunc:
             return {
                 "pseudocode": str(cfunc),
                 "address": f"0x{addr:08X}",
             }
-        return {"error": "Decompilation failed"}
-    except ida_hexrays.DecompilationFailure as e:
-        return {"error": f"Decompilation failed: {e}"}
+        err = f"code={hf.code} module={hf.str!r} at 0x{hf.errea:08X}"
+        return {"error": f"Decompilation failed: {err}"}
+    except Exception as e:
+        return {"error": f"Decompilation failed: {type(e).__name__}: {e}"}
+
+
+def execute_python(code):
+    """Execute arbitrary Python in IDA's main thread context and return result."""
+    import io, contextlib
+    stdout_buf = io.StringIO()
+    result_ns = {}
+    try:
+        with contextlib.redirect_stdout(stdout_buf):
+            exec(compile(code, "<mcp_exec>", "exec"), result_ns)
+        return {
+            "output": stdout_buf.getvalue(),
+            "result": result_ns.get("_result"),
+            "success": True,
+        }
+    except Exception as e:
+        import traceback as tb
+        return {
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": tb.format_exc(),
+            "output": stdout_buf.getvalue(),
+            "success": False,
+        }
 
 
 def _mcp_log(msg, addr=None):
@@ -574,7 +599,7 @@ def get_idb_info():
         "functions": func_count,
         "segments": seg_count,
         "processor": ida_ida.inf_get_procname() if hasattr(ida_ida, 'inf_get_procname') else "unknown",
-        "bits": 64 if ida_ida.inf_is_64bit() else 32,
+        "bits": 64 if (ida_ida.inf_is_64bit() if hasattr(ida_ida, 'inf_is_64bit') else False) else 32,
     }
 
 
@@ -2116,6 +2141,12 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 return decompile_function(_parse_addr(addr_str))
             return {"error": "Provide 'address' or 'name'"}
 
+        elif path == "/execute_python":
+            code = body.get("code", "")
+            if not code:
+                return {"error": "Provide 'code'"}
+            return execute_python(code)
+
         elif path == "/xrefs_to":
             addr_str = body.get("address")
             name = body.get("name")
@@ -2528,14 +2559,14 @@ def start_server():
     _ui_timer = _MainThreadTimer(interval_ms=100)
 
     port = _find_free_port()
-    _server = http.server.HTTPServer(("127.0.0.1", port), MCPHandler)
+    _server = http.server.HTTPServer((BIND_HOST, port), MCPHandler)
     _thread = threading.Thread(target=_server.serve_forever, daemon=True)
     _thread.start()
     _reg_path = _register(port)
 
     _register_notebook_action()
 
-    print(f"[MCP] Server started on http://127.0.0.1:{port}")
+    print(f"[MCP] Server started on http://{BIND_HOST}:{port}")
     print(f"[MCP] IDB: {_idb_name()}")
     print(f"[MCP] Registration: {_reg_path}")
     print(f"[MCP] Notebook viewer hotkey: Ctrl+Shift+N")

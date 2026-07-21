@@ -3,8 +3,14 @@
 MCP server for IDA Pro — proxies Claude Code tool calls to IDA HTTP plugin(s).
 
 Usage:
-    python ida/mcp_server.py              # stdio mode for Claude Code
-    python ida/mcp_server.py --list       # list active instances
+    python ida/mcp_server.py                         # local instances via ~/.ida_mcp/
+    python ida/mcp_server.py --remote 192.168.1.5   # remote IDA (port 13337)
+    python ida/mcp_server.py --remote 192.168.1.5:13338
+    python ida/mcp_server.py --list                  # list local instances
+
+Remote mode: set IDA_MCP_REMOTE=host[:port] in the environment, or pass --remote.
+On the remote machine, launch IDA with IDA_MCP_BIND=0.0.0.0 so the plugin
+listens on all interfaces instead of 127.0.0.1.
 """
 
 import os
@@ -15,11 +21,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mcp.server.fastmcp import FastMCP
 
-from common import call_instance, discover_instances, list_instances_text
+from common import call_instance, call_remote, discover_instances, list_instances_text
 
 REG_DIR = os.path.expanduser("~/.ida_mcp")
 TOOL = "IDA"
 NAME_KEYS = ("idb", "idb_path")
+
+# Remote override: env var or --remote flag
+_remote_arg = None
+if "--remote" in sys.argv:
+    _remote_arg = sys.argv[sys.argv.index("--remote") + 1]
+REMOTE = os.environ.get("IDA_MCP_REMOTE") or _remote_arg
 
 mcp = FastMCP("ida")
 
@@ -31,6 +43,8 @@ def _call(endpoint, body=None, idb=None, timeout=10):
     instead of hanging. Endpoints that legitimately wait longer (today
     only dbg_wait_event) must pass an explicit ``timeout``.
     """
+    if REMOTE:
+        return call_remote(REMOTE, endpoint, body, timeout=timeout)
     return call_instance(REG_DIR, endpoint, body, target=idb,
                          tool_name=TOOL, name_keys=NAME_KEYS, timeout=timeout)
 
@@ -38,6 +52,9 @@ def _call(endpoint, body=None, idb=None, timeout=10):
 @mcp.tool()
 def list_instances() -> str:
     """List all active IDA instances with their loaded IDBs."""
+    if REMOTE:
+        result = call_remote(REMOTE, "/info", timeout=10)
+        return f"Remote IDA at {REMOTE}: {result}"
     return list_instances_text(REG_DIR, TOOL, name_key="idb")
 
 
@@ -782,6 +799,21 @@ def scratch_refresh(idb: str = "") -> dict:
     return _call("/scratch_refresh", {}, idb=idb or None)
 
 
+def _scan(host: str, port_range: range = range(13337, 13400)) -> list[dict]:
+    """Probe a host for IDA MCP plugin instances by pinging the port range."""
+    import httpx
+    found = []
+    for port in port_range:
+        try:
+            r = httpx.get(f"http://{host}:{port}/ping", timeout=0.5)
+            info = r.json()
+            if info.get("status") == "ok":
+                found.append({"host": host, "port": port, "idb": info.get("idb", "?")})
+        except Exception:
+            pass
+    return found
+
+
 if __name__ == "__main__":
     if "--list" in sys.argv:
         instances = discover_instances(REG_DIR)
@@ -792,5 +824,16 @@ if __name__ == "__main__":
             for inst in instances:
                 print(f"  port:{inst['port']}  pid:{inst.get('pid','?')}  idb:{inst.get('idb','?')}")
                 print(f"    path: {inst.get('idb_path', '?')}")
+    elif "--scan" in sys.argv:
+        idx = sys.argv.index("--scan")
+        host = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else "127.0.0.1"
+        print(f"Scanning {host} for IDA MCP instances (ports 13337-13399)...")
+        found = _scan(host)
+        if not found:
+            print("  None found.")
+        else:
+            for inst in found:
+                print(f"  {inst['host']}:{inst['port']}  idb:{inst['idb']}")
+            print(f"\nTo use: --remote {found[0]['host']}:{found[0]['port']}")
     else:
         mcp.run(transport="stdio")
