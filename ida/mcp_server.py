@@ -290,6 +290,36 @@ def find_micromips_prologues(idb: str = "") -> dict:
 
 
 @mcp.tool()
+def open_file(local_path: str, remote_filename: str = "", spawn: bool = True, idb: str = "") -> dict:
+    """Upload a local binary to the remote IDA machine and optionally open it in a new IDA instance.
+
+    The file is base64-encoded and sent to the remote plugin, which saves it to
+    ~/.ida_mcp/uploads/<filename>. When spawn=True (default), a new IDA process
+    opens the file automatically. After auto-analysis completes, use --scan or
+    list_instances() to discover the new instance's port.
+
+    Works for both local and remote modes. In local mode the file is copied to
+    ~/.ida_mcp/uploads/ without needing a network transfer.
+
+    Args:
+        local_path: Path to the binary on this machine
+        remote_filename: Filename to use on the remote side (default: basename of local_path)
+        spawn: If True (default), launch a new IDA instance on the uploaded file
+        idb: IDB substring to target a specific instance (optional)
+    """
+    import base64
+    import os as _os
+    fname = remote_filename or _os.path.basename(local_path)
+    try:
+        with open(local_path, "rb") as f:
+            data_b64 = base64.b64encode(f.read()).decode()
+    except OSError as e:
+        return {"error": f"Cannot read {local_path}: {e}"}
+    return _call("/upload", {"filename": fname, "data": data_b64, "spawn": spawn},
+                 idb=idb or None, timeout=120)
+
+
+@mcp.tool()
 def define_type(decl: str, idb: str = "") -> dict:
     """Parse C struct/union/typedef/function declarations into the IDB type library.
 

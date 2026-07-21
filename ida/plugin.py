@@ -1985,6 +1985,51 @@ def scratch_refresh():
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def upload_file(filename: str, data_b64: str, spawn: bool = False) -> dict:
+    """Save base64-encoded bytes to ~/.ida_mcp/uploads/ and optionally open in a new IDA."""
+    import base64
+    import subprocess
+
+    # Sanitize: strip any path components the caller might sneak in
+    safe_name = os.path.basename(filename) or "upload.bin"
+    upload_dir = os.path.join(REGISTRATION_DIR, "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    dest = os.path.join(upload_dir, safe_name)
+
+    try:
+        raw = base64.b64decode(data_b64)
+    except Exception as e:
+        return {"error": f"Base64 decode failed: {e}"}
+
+    with open(dest, "wb") as f:
+        f.write(raw)
+
+    result = {"path": dest, "size": len(raw), "spawned": False}
+
+    if spawn:
+        # sys.argv[0] is the IDA executable (ida64, idat64, etc.)
+        ida_bin = sys.argv[0] if sys.argv else None
+        if not ida_bin or not os.path.isfile(ida_bin):
+            result["spawn_error"] = f"Cannot locate IDA binary (sys.argv[0]={sys.argv[0]!r})"
+            return result
+        try:
+            proc = subprocess.Popen(
+                [ida_bin, dest],
+                start_new_session=True,
+                close_fds=True,
+            )
+            result["spawned"] = True
+            result["spawned_pid"] = proc.pid
+            result["note"] = (
+                f"New IDA instance (PID {proc.pid}) opening {dest}. "
+                "After auto-analysis completes, use --scan to find the new port."
+            )
+        except Exception as e:
+            result["spawn_error"] = f"Popen failed: {e}"
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # HTTP request handler
 # ---------------------------------------------------------------------------
@@ -2473,6 +2518,14 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 
         elif path == "/scratch_refresh":
             return scratch_refresh()
+
+        elif path == "/upload":
+            filename = body.get("filename", "upload.bin")
+            data_b64 = body.get("data", "")
+            spawn = body.get("spawn", False)
+            if not data_b64:
+                return {"error": "Provide 'data' (base64-encoded file bytes)"}
+            return upload_file(filename, data_b64, spawn=spawn)
 
         else:
             return {"error": f"Unknown endpoint: {path}"}
