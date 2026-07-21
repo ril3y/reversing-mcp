@@ -2007,17 +2007,22 @@ def upload_file(filename: str, data_b64: str, spawn: bool = False) -> dict:
     result = {"path": dest, "size": len(raw), "spawned": False}
 
     if spawn:
-        # sys.argv[0] is the IDA executable (ida64, idat64, etc.)
+        # sys.argv[0] is the IDA executable (ida64.exe on Windows, ida64 on Unix)
         ida_bin = sys.argv[0] if sys.argv else None
         if not ida_bin or not os.path.isfile(ida_bin):
             result["spawn_error"] = f"Cannot locate IDA binary (sys.argv[0]={sys.argv[0]!r})"
             return result
         try:
-            proc = subprocess.Popen(
-                [ida_bin, dest],
-                start_new_session=True,
-                close_fds=True,
-            )
+            if sys.platform == "win32":
+                popen_kwargs = {
+                    "creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                }
+            else:
+                popen_kwargs = {
+                    "start_new_session": True,
+                    "close_fds": True,
+                }
+            proc = subprocess.Popen([ida_bin, dest], **popen_kwargs)
             result["spawned"] = True
             result["spawned_pid"] = proc.pid
             result["note"] = (
