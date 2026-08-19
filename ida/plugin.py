@@ -13,6 +13,7 @@ import json
 import os
 import re
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -54,8 +55,28 @@ def _xref_type_name(t):
 REGISTRATION_DIR = os.path.expanduser("~/.ida_mcp")
 BASE_PORT = 13337
 MAX_PORT = 13400
-# Set IDA_MCP_BIND=0.0.0.0 on the remote machine to allow network connections.
-BIND_HOST = os.environ.get("IDA_MCP_BIND", "127.0.0.1")
+
+
+def _detect_lan_ip():
+    """Best-effort primary LAN IPv4, auto-detected (no traffic sent).
+
+    'Connects' a UDP socket toward a public address and reads the local
+    endpoint the OS would route through — yields the real LAN IP without
+    hardcoding it or sending packets. Falls back to 127.0.0.1.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as _s:
+            _s.connect(("8.8.8.8", 80))
+            return _s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
+# Interface to bind on. Default 0.0.0.0 so a remote MCP bridge can reach this
+# instance over the LAN (not just localhost). Override with IDA_MCP_BIND=127.0.0.1.
+BIND_HOST = os.environ.get("IDA_MCP_BIND", "0.0.0.0").strip() or "0.0.0.0"
+# The real reachable address to advertise (registration file + startup banner).
+ADVERTISE_HOST = "127.0.0.1" if BIND_HOST in ("127.0.0.1", "localhost") else _detect_lan_ip()
 
 # Headless mode: idat / idat64 (text UI) rather than ida / ida64 (GUI).
 # register_timer does not fire without the Qt event loop, so in headless
@@ -2566,6 +2587,7 @@ def _register(port):
     info = {
         "pid": pid,
         "port": port,
+        "host": ADVERTISE_HOST,
         "idb": _idb_name(),
         "idb_path": _idb_path(),
     }
@@ -2648,7 +2670,7 @@ def start_server():
         _register_notebook_action()
         print(f"[MCP] Notebook viewer hotkey: Ctrl+Shift+N")
 
-    print(f"[MCP] Server started on http://{BIND_HOST}:{port}")
+    print(f"[MCP] Server started on http://{ADVERTISE_HOST}:{port}  (bind={BIND_HOST})")
     print(f"[MCP] IDB: {_idb_name()}")
     print(f"[MCP] Registration: {_reg_path}")
 
