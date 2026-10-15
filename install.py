@@ -285,6 +285,30 @@ def deploy_unicorn(ctx: Context) -> Result:
                   note="Launch: `python unicorn/bridge.py --arch thumb`")
 
 
+# ---- Frida ----
+#
+# Frida is the simplest of the tools to install: frida-python IS the client,
+# so there's no in-tool bridge to build/copy. Just pip install the two
+# packages and register the MCP server.
+
+def build_frida(ctx: Context) -> Result:
+    if ctx.skip_builds:
+        return Result(True, "(skipped per --skip-builds)")
+    rc = _run([sys.executable, "-m", "pip", "install", "frida", "frida-tools"],
+              dry=ctx.dry_run)
+    if rc != 0:
+        return Result(False, f"pip install exited {rc}")
+    return Result(True, "frida + frida-tools installed",
+                  note="Local instrumentation works now. For Android/iOS, "
+                       "push frida-server-<ver>-<arch> to the target — see "
+                       "frida/README.md.")
+
+
+def deploy_frida(ctx: Context) -> Result:
+    return Result(True, "no deploy step",
+                  note="MCP server uses frida-python directly — no bridge/plugin to copy.")
+
+
 # ---- Registry ----
 
 TOOLS: list[Tool] = [
@@ -304,6 +328,11 @@ TOOLS: list[Tool] = [
          "Pure-Python emulator MCP. WIP — lives on the `unicorn` branch.",
          "unicorn/mcp_server.py", build_unicorn, deploy_unicorn,
          requires_branch="unicorn"),
+    Tool("frida",   "Frida",
+         "Dynamic instrumentation. Hooks/dumps a running process via frida-python — "
+         "no in-tool bridge needed. Needs a frida-server on the target for "
+         "Android/iOS; local processes work out of the box.",
+         "frida/mcp_server.py",  build_frida,   deploy_frida),
 ]
 
 
