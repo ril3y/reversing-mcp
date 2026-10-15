@@ -314,7 +314,7 @@ def build_jadx(ctx: Context) -> Result:
     # Fast path: prebuilt fat JAR.
     if not ctx.from_source:
         assets = _fetch_latest_release_assets(ctx.release_tag)
-        pick = _pick_asset(assets, "jadx-mcp-bridge", "-all.jar")
+        pick = _pick_asset(assets, "jadx-mcp-bridge", ".jar")
         if pick:
             name, url = pick
             dst = bridge_dir / "build" / "libs" / name

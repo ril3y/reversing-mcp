@@ -24,7 +24,7 @@ get going:
 |--------|-------------------------------------|----------------------------|
 | IDA    | Copies `ida/plugin.py` into your IDA user plugins dir | n/a — no build step |
 | Ghidra | Downloads `ghidra-mcp-bridge.zip` from latest release → `~/.ghidra/.ghidra_<ver>/Extensions/` | `gradle build` against your `GHIDRA_INSTALL_DIR` (needs JDK 21) |
-| jadx   | Downloads `jadx-mcp-bridge-all.jar` from latest release | `./gradlew shadowJar` (needs JDK 17+) |
+| jadx   | Downloads `jadx-mcp-bridge.jar` from latest release | `./gradlew shadowJar` (needs JDK 17+) |
 | ILSpy  | Downloads `ilspy-mcp-bridge.zip` and unpacks it | `dotnet publish -c Release` (needs .NET 8 SDK) |
 | Unicorn| `pip install unicorn capstone`     | n/a — pip is the build |
 | Frida  | `pip install frida frida-tools` (for Android/iOS also push `frida-server` to the device — see `frida/README.md`) | n/a — no in-tool bridge |
@@ -174,7 +174,7 @@ Unlike Ghidra/IDA, jadx has no resident GUI to host the bridge — it's a separa
 ```bash
 cd jadx/jadx-mcp-bridge
 ./gradlew shadowJar                        # Windows: .\gradlew.bat shadowJar  (JDK 17+ required)
-java -jar build/libs/jadx-mcp-bridge-all.jar /path/to/app.apk
+java -jar build/libs/jadx-mcp-bridge.jar /path/to/app.apk
 ```
 
 The bridge writes `~/.jadx_mcp/<pid>.json` and the MCP server picks it up. Run multiple bridges for multiple APKs; target one from Claude with `jar="app.apk"`.

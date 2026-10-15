@@ -108,7 +108,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: jadx-mcp-bridge
-          path: jadx/jadx-mcp-bridge/build/libs/*-all.jar
+          path: jadx/jadx-mcp-bridge/build/libs/jadx-mcp-bridge.jar
           if-no-files-found: error
 
   # ----- ILSpy bridge ----------------------------------------------------
@@ -158,7 +158,7 @@ jobs:
         run: |
           set -eux
           mkdir release
-          find artifacts -type f \( -name '*.zip' -o -name '*-all.jar' \) -exec cp {} release/ \;
+          find artifacts -type f \( -name '*.zip' -o -name 'jadx-mcp-bridge.jar' \) -exec cp {} release/ \;
           ls -la release
 
       - name: Determine tag
