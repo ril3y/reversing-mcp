@@ -116,6 +116,23 @@ def call_instance(reg_dir: str, endpoint: str, body: dict | None = None,
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def call_remote(remote: str, endpoint: str, body: dict | None = None,
+                timeout: int = 30) -> dict:
+    """HTTP call to an explicit remote host:port, bypassing local discovery."""
+    host_port = remote if ":" in remote else f"{remote}:13337"
+    url = f"http://{host_port}{endpoint}"
+    try:
+        if body is not None:
+            r = httpx.post(url, json=body, timeout=timeout)
+        else:
+            r = httpx.get(url, timeout=timeout)
+        return r.json()
+    except httpx.ConnectError:
+        return {"error": f"Cannot connect to {host_port} — is the plugin running with IDA_MCP_BIND=0.0.0.0?"}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def list_instances_text(reg_dir: str, tool_name: str,
                         name_key: str = "name") -> str:
     """Format instance list as human-readable text."""

@@ -13,6 +13,7 @@ import json
 import os
 import re
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -56,6 +57,35 @@ BASE_PORT = 13337
 MAX_PORT = 13400
 
 
+def _detect_lan_ip():
+    """Best-effort primary LAN IPv4, auto-detected (no traffic sent).
+
+    'Connects' a UDP socket toward a public address and reads the local
+    endpoint the OS would route through — yields the real LAN IP without
+    hardcoding it or sending packets. Falls back to 127.0.0.1.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as _s:
+            _s.connect(("8.8.8.8", 80))
+            return _s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
+# Interface to bind on. Default 0.0.0.0 so a remote MCP bridge can reach this
+# instance over the LAN (not just localhost). Override with IDA_MCP_BIND=127.0.0.1.
+BIND_HOST = os.environ.get("IDA_MCP_BIND", "0.0.0.0").strip() or "0.0.0.0"
+# The real reachable address to advertise (registration file + startup banner).
+ADVERTISE_HOST = "127.0.0.1" if BIND_HOST in ("127.0.0.1", "localhost") else _detect_lan_ip()
+
+# Headless mode: idat / idat64 (text UI) rather than ida / ida64 (GUI).
+# register_timer does not fire without the Qt event loop, so in headless
+# mode we route every request through execute_sync instead.
+try:
+    _HEADLESS = not ida_kernwin.is_idaq()
+except Exception:
+    _HEADLESS = False
+
 _request_queue = []
 _request_lock = threading.Lock()
 
@@ -63,42 +93,54 @@ _request_lock = threading.Lock()
 def _run_on_main_thread(func, *args, **kwargs):
     """Execute a function on IDA's main thread and return its result.
 
-    IDA's API is not thread-safe -- all ida_*/idc/idautils calls must
-    run on the main thread. The HTTP server runs in a background thread.
+    GUI mode: queue + UI timer (register_timer fires every 100 ms).
+    Headless mode: execute_sync (works in idat without the Qt event loop).
 
-    We put work on a queue and a UI timer drains it on the main thread.
-    The HTTP handler thread blocks on an Event until the result is ready.
-    This never deadlocks because we never call execute_sync.
-
-    If the request stays queued for >5 s we log a warning to IDA's
-    Output window — common causes:
-      - a modal dialog blocking the main thread (Hex-Rays warning,
-        "save changes?", "type already exists, overwrite?")
-      - a previous Hex-Rays call chewing on an obfuscated function
-      - the viewer's QTimer doing slow work (e.g. live decompile macros)
-    idc.batch(1) wrapping in _MainThreadTimer._tick suppresses dialogs,
-    but the other two cases are visible as queue-wait warnings.
-
-    The label argument (if provided in kwargs as `_mcp_label`) is included
-    in the warning so the user can identify which request stalled.
+    In GUI mode, if the request stays queued for >5 s a warning is printed —
+    common causes: modal dialog, slow Hex-Rays call, viewer macro decompile.
     """
     label = kwargs.pop("_mcp_label", None) or getattr(func, "__name__", repr(func))
 
+    if _HEADLESS:
+        # execute_sync blocks the calling (background) thread until the
+        # function has run on the main thread — exactly what we need.
+        result = [None]
+        error  = [None]
+
+        def _thunk():
+            prev = 0
+            try:
+                prev = idc.batch(1)
+                result[0] = func(*args, **kwargs)
+            except Exception as e:
+                error[0] = e
+            finally:
+                try:
+                    idc.batch(prev)
+                except Exception:
+                    pass
+            return 0  # execute_sync expects an int
+
+        ida_kernwin.execute_sync(_thunk, ida_kernwin.MFF_FAST)
+        if error[0] is not None:
+            raise error[0]
+        return result[0]
+
+    # GUI mode — original queue + timer path
     result = [None]
-    error = [None]
-    done = threading.Event()
+    error  = [None]
+    done   = threading.Event()
 
     item = (func, args, kwargs, result, error, done)
     with _request_lock:
         _request_queue.append(item)
 
-    # Wait for the timer to process our request; surface a warning after 5s.
     if not done.wait(timeout=5.0):
         ida_kernwin.msg(
             f"[MCP] WARNING: '{label}' queued for >5s — main thread busy "
             f"(modal dialog? slow Hex-Rays call? viewer macro decompile?).\n"
         )
-        done.wait()  # block until the timer fires
+        done.wait()
 
     if error[0] is not None:
         raise error[0]
@@ -157,7 +199,7 @@ def _find_free_port():
     for port in range(BASE_PORT, MAX_PORT):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", port))
+                s.bind((BIND_HOST, port))
                 return port
         except OSError:
             continue
@@ -388,19 +430,42 @@ def get_bytes_at(addr, size):
 
 
 def decompile_function(addr):
-    """Decompile a function using Hex-Rays (if available)."""
-    if not ida_hexrays.init_hexrays_plugin():
-        return {"error": "Hex-Rays not available"}
+    """Decompile a function using Hex-Rays (IDA 9.x compatible)."""
     try:
-        cfunc = ida_hexrays.decompile(addr)
+        hf = ida_hexrays.hexrays_failure_t()
+        cfunc = ida_hexrays.decompile(addr, hf)
         if cfunc:
             return {
                 "pseudocode": str(cfunc),
                 "address": f"0x{addr:08X}",
             }
-        return {"error": "Decompilation failed"}
-    except ida_hexrays.DecompilationFailure as e:
-        return {"error": f"Decompilation failed: {e}"}
+        err = f"code={hf.code} module={hf.str!r} at 0x{hf.errea:08X}"
+        return {"error": f"Decompilation failed: {err}"}
+    except Exception as e:
+        return {"error": f"Decompilation failed: {type(e).__name__}: {e}"}
+
+
+def execute_python(code):
+    """Execute arbitrary Python in IDA's main thread context and return result."""
+    import io, contextlib
+    stdout_buf = io.StringIO()
+    result_ns = {}
+    try:
+        with contextlib.redirect_stdout(stdout_buf):
+            exec(compile(code, "<mcp_exec>", "exec"), result_ns)
+        return {
+            "output": stdout_buf.getvalue(),
+            "result": result_ns.get("_result"),
+            "success": True,
+        }
+    except Exception as e:
+        import traceback as tb
+        return {
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": tb.format_exc(),
+            "output": stdout_buf.getvalue(),
+            "success": False,
+        }
 
 
 def _mcp_log(msg, addr=None):
@@ -574,7 +639,7 @@ def get_idb_info():
         "functions": func_count,
         "segments": seg_count,
         "processor": ida_ida.inf_get_procname() if hasattr(ida_ida, 'inf_get_procname') else "unknown",
-        "bits": 64 if ida_ida.inf_is_64bit() else 32,
+        "bits": 64 if (ida_ida.inf_is_64bit() if hasattr(ida_ida, 'inf_is_64bit') else False) else 32,
     }
 
 
@@ -1960,6 +2025,56 @@ def scratch_refresh():
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def upload_file(filename: str, data_b64: str, spawn: bool = False) -> dict:
+    """Save base64-encoded bytes to ~/.ida_mcp/uploads/ and optionally open in a new IDA."""
+    import base64
+    import subprocess
+
+    # Sanitize: strip any path components the caller might sneak in
+    safe_name = os.path.basename(filename) or "upload.bin"
+    upload_dir = os.path.join(REGISTRATION_DIR, "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    dest = os.path.join(upload_dir, safe_name)
+
+    try:
+        raw = base64.b64decode(data_b64)
+    except Exception as e:
+        return {"error": f"Base64 decode failed: {e}"}
+
+    with open(dest, "wb") as f:
+        f.write(raw)
+
+    result = {"path": dest, "size": len(raw), "spawned": False}
+
+    if spawn:
+        # sys.argv[0] is the IDA executable (ida64.exe on Windows, ida64 on Unix)
+        ida_bin = sys.argv[0] if sys.argv else None
+        if not ida_bin or not os.path.isfile(ida_bin):
+            result["spawn_error"] = f"Cannot locate IDA binary (sys.argv[0]={sys.argv[0]!r})"
+            return result
+        try:
+            if sys.platform == "win32":
+                popen_kwargs = {
+                    "creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                }
+            else:
+                popen_kwargs = {
+                    "start_new_session": True,
+                    "close_fds": True,
+                }
+            proc = subprocess.Popen([ida_bin, dest], **popen_kwargs)
+            result["spawned"] = True
+            result["spawned_pid"] = proc.pid
+            result["note"] = (
+                f"New IDA instance (PID {proc.pid}) opening {dest}. "
+                "After auto-analysis completes, use --scan to find the new port."
+            )
+        except Exception as e:
+            result["spawn_error"] = f"Popen failed: {e}"
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # HTTP request handler
 # ---------------------------------------------------------------------------
@@ -2115,6 +2230,12 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             if addr_str:
                 return decompile_function(_parse_addr(addr_str))
             return {"error": "Provide 'address' or 'name'"}
+
+        elif path == "/execute_python":
+            code = body.get("code", "")
+            if not code:
+                return {"error": "Provide 'code'"}
+            return execute_python(code)
 
         elif path == "/xrefs_to":
             addr_str = body.get("address")
@@ -2443,6 +2564,14 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/scratch_refresh":
             return scratch_refresh()
 
+        elif path == "/upload":
+            filename = body.get("filename", "upload.bin")
+            data_b64 = body.get("data", "")
+            spawn = body.get("spawn", False)
+            if not data_b64:
+                return {"error": "Provide 'data' (base64-encoded file bytes)"}
+            return upload_file(filename, data_b64, spawn=spawn)
+
         else:
             return {"error": f"Unknown endpoint: {path}"}
 
@@ -2458,6 +2587,7 @@ def _register(port):
     info = {
         "pid": pid,
         "port": port,
+        "host": ADVERTISE_HOST,
         "idb": _idb_name(),
         "idb_path": _idb_path(),
     }
@@ -2517,28 +2647,32 @@ def _register_notebook_action():
 
 
 def start_server():
-    """Start the HTTP server and main-thread timer."""
+    """Start the HTTP server and main-thread dispatcher."""
     global _server, _thread, _reg_path, _ui_timer
 
     if _server is not None:
         print(f"[MCP] Server already running on port {_server.server_port}")
         return
 
-    # Start the UI timer that processes requests on the main thread
-    _ui_timer = _MainThreadTimer(interval_ms=100)
+    if _HEADLESS:
+        # Headless: execute_sync handles dispatch — no timer needed.
+        print("[MCP] Headless mode: using execute_sync dispatch (no UI timer)")
+    else:
+        _ui_timer = _MainThreadTimer(interval_ms=100)
 
     port = _find_free_port()
-    _server = http.server.HTTPServer(("127.0.0.1", port), MCPHandler)
+    _server = http.server.HTTPServer((BIND_HOST, port), MCPHandler)
     _thread = threading.Thread(target=_server.serve_forever, daemon=True)
     _thread.start()
     _reg_path = _register(port)
 
-    _register_notebook_action()
+    if not _HEADLESS:
+        _register_notebook_action()
+        print(f"[MCP] Notebook viewer hotkey: Ctrl+Shift+N")
 
-    print(f"[MCP] Server started on http://127.0.0.1:{port}")
+    print(f"[MCP] Server started on http://{ADVERTISE_HOST}:{port}  (bind={BIND_HOST})")
     print(f"[MCP] IDB: {_idb_name()}")
     print(f"[MCP] Registration: {_reg_path}")
-    print(f"[MCP] Notebook viewer hotkey: Ctrl+Shift+N")
 
 
 def stop_server():

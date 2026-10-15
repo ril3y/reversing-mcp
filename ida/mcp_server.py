@@ -3,8 +3,14 @@
 MCP server for IDA Pro — proxies Claude Code tool calls to IDA HTTP plugin(s).
 
 Usage:
-    python ida/mcp_server.py              # stdio mode for Claude Code
-    python ida/mcp_server.py --list       # list active instances
+    python ida/mcp_server.py                         # local instances via ~/.ida_mcp/
+    python ida/mcp_server.py --remote 192.168.1.5   # remote IDA (port 13337)
+    python ida/mcp_server.py --remote 192.168.1.5:13338
+    python ida/mcp_server.py --list                  # list local instances
+
+Remote mode: set IDA_MCP_REMOTE=host[:port] in the environment, or pass --remote.
+On the remote machine, launch IDA with IDA_MCP_BIND=0.0.0.0 so the plugin
+listens on all interfaces instead of 127.0.0.1.
 """
 
 import os
@@ -15,13 +21,76 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mcp.server.fastmcp import FastMCP
 
-from common import call_instance, discover_instances, list_instances_text
+from common import call_instance, call_remote, discover_instances, list_instances_text
 
 REG_DIR = os.path.expanduser("~/.ida_mcp")
 TOOL = "IDA"
 NAME_KEYS = ("idb", "idb_path")
 
+# Remote override: env var or --remote flag
+_remote_arg = None
+if "--remote" in sys.argv:
+    _remote_arg = sys.argv[sys.argv.index("--remote") + 1]
+# TEMP: hardcoded BEAST LAN IP as the default remote target so no env/config
+# change is needed. Precedence: IDA_MCP_REMOTE env > --remote flag > this default.
+# Set IDA_MCP_REMOTE="" (or remove this fallback) to go back to local mode.
+REMOTE = os.environ.get("IDA_MCP_REMOTE") or _remote_arg or "192.168.1.189,192.168.1.35"
+
+
+def _remote_hosts():
+    """REMOTE may be a comma-separated list of bare hosts (or host:port entries)."""
+    return [h.strip() for h in REMOTE.split(",") if h.strip()] if REMOTE else []
+
 mcp = FastMCP("ida")
+
+
+# ---------------------------------------------------------------------------
+# Remote multi-instance support.
+# IDA_MCP_REMOTE may be a bare host ("192.168.1.189") or host:port.
+#   - host:port  -> target that one instance (explicit).
+#   - bare host  -> scan its port range once (cached) and route by `idb`,
+#                   mirroring local discovery. Plugin must bind non-localhost
+#                   (IDA_MCP_BIND=0.0.0.0, the new default).
+# ---------------------------------------------------------------------------
+_REMOTE_CACHE = {"host": None, "instances": []}
+
+
+def _remote_has_port():
+    # only the explicit single-host:port form skips discovery
+    hosts = _remote_hosts()
+    return len(hosts) == 1 and ":" in hosts[0]
+
+
+def _remote_scan(force=False):
+    """Discover instances across ALL remote hosts in the REMOTE list (cached across calls)."""
+    if _REMOTE_CACHE["host"] == REMOTE and _REMOTE_CACHE["instances"] and not force:
+        return _REMOTE_CACHE["instances"]
+    found = _scan_hosts(_remote_hosts())
+    _REMOTE_CACHE.update(host=REMOTE, instances=found)
+    return found
+
+
+def _remote_resolve(idb=None):
+    """Pick a remote instance by idb substring, else the first."""
+    insts = _remote_scan()
+    if not insts:
+        return None
+    if idb:
+        t = idb.lower()
+        return next((i for i in insts if t in i.get("idb", "").lower()), None)
+    return insts[0]
+
+
+def _remote_call(endpoint, body=None, idb=None, timeout=10):
+    inst = _remote_resolve(idb)
+    if inst is None:                      # stale cache? rescan once
+        insts = _remote_scan(force=True)
+        inst = _remote_resolve(idb)
+        if inst is None:
+            names = [i.get("idb", "?") for i in insts]
+            who = f" matching '{idb}'" if idb else ""
+            return {"error": f"No remote IDA instance{who} on {REMOTE}. Available: {names}"}
+    return call_remote(f"{inst['host']}:{inst['port']}", endpoint, body, timeout=timeout)
 
 
 def _call(endpoint, body=None, idb=None, timeout=10):
@@ -31,6 +100,10 @@ def _call(endpoint, body=None, idb=None, timeout=10):
     instead of hanging. Endpoints that legitimately wait longer (today
     only dbg_wait_event) must pass an explicit ``timeout``.
     """
+    if REMOTE:
+        if _remote_has_port():
+            return call_remote(REMOTE, endpoint, body, timeout=timeout)
+        return _remote_call(endpoint, body, idb=idb, timeout=timeout)
     return call_instance(REG_DIR, endpoint, body, target=idb,
                          tool_name=TOOL, name_keys=NAME_KEYS, timeout=timeout)
 
@@ -38,7 +111,49 @@ def _call(endpoint, body=None, idb=None, timeout=10):
 @mcp.tool()
 def list_instances() -> str:
     """List all active IDA instances with their loaded IDBs."""
+    if REMOTE:
+        if _remote_has_port():
+            result = call_remote(REMOTE, "/info", timeout=10)
+            return f"Remote IDA at {REMOTE}: {result}"
+        insts = _remote_scan(force=True)
+        if not insts:
+            return f"No active IDA instances on remote {REMOTE} (is IDA open with the LAN-bound plugin?)."
+        lines = [f"  {i['host']}:{i['port']}  idb:{i.get('idb','?')}" for i in insts]
+        return f"{len(insts)} active remote IDA instance(s) on {REMOTE}:\n" + "\n".join(lines)
     return list_instances_text(REG_DIR, TOOL, name_key="idb")
+
+
+@mcp.tool()
+def set_remote(hosts: str) -> str:
+    """Point the MCP at IDA host(s) at RUNTIME -- no env var, no restart.
+
+    Args:
+        hosts: comma-separated host or host:port entries, e.g.
+            "10.2.0.2:13340"          one explicit instance
+            "10.2.0.2"                scan that host's port range, route by idb
+            "10.2.0.2,192.168.1.189"  scan several
+            ""                        clear remote -> fall back to local
+
+    Returns the instances discovered so the connection is confirmed immediately.
+    """
+    global REMOTE
+    REMOTE = (hosts or "").strip()
+    _REMOTE_CACHE.update(host=None, instances=[])  # invalidate discovery cache
+    if not REMOTE:
+        return "Remote cleared -- using local IDA instances."
+    if _remote_has_port():
+        return f"Remote set to {REMOTE}. Instance: {call_remote(REMOTE, '/info', timeout=10)}"
+    insts = _remote_scan(force=True)
+    if not insts:
+        return f"Remote set to {REMOTE}, but no instances answered (is IDA open + plugin LAN-bound?)."
+    lines = [f"  {i['host']}:{i['port']}  idb:{i.get('idb','?')}" for i in insts]
+    return f"Remote set to {REMOTE}. {len(insts)} instance(s):\n" + "\n".join(lines)
+
+
+@mcp.tool()
+def get_remote() -> str:
+    """Show the remote host(s) the MCP is currently targeting."""
+    return REMOTE or "(local mode -- no remote set)"
 
 
 @mcp.tool()
@@ -263,6 +378,83 @@ def make_code(address: str, size: int = 0, idb: str = "") -> dict:
 
 
 @mcp.tool()
+def execute_python(code: str, idb: str = "") -> dict:
+    """Run arbitrary IDAPython in the target IDB's main thread; returns stdout + `_result`.
+
+    Assign a variable named ``_result`` in your code to return a value. Use for load-time
+    fixups (set_processor_type, rebase_program, Thumb sreg ranges, add_entry), bulk edits,
+    or anything without a dedicated tool.
+
+    Args:
+        code: Python source executed inside IDA.
+        idb: IDB filename substring to target (optional).
+    """
+    return _call("/execute_python", {"code": code}, idb=idb or None, timeout=180)
+
+
+@mcp.tool()
+def setup_arm_firmware(base: str = "", thumb: bool = True, bits: int = 32,
+                       seed_prologues: bool = True, analyze: bool = True, idb: str = "") -> dict:
+    """Load-fix a raw ARM firmware IDB (MTK preloader/DA etc.) in ONE call.
+
+    Encodes the MediaTek profile and the common gotchas:
+      * forces segment **bitness** (IDA often mis-defaults ARMv8 chips to AArch64 — wrong for a
+        32-bit preloader; that makes every instruction decode as garbage),
+      * **rebases** to the right base — auto-parsed from the MTK GFH FILE_INFO header when ``base``
+        is omitted (base = load_addr - content_offset),
+      * sets the **Thumb** default,
+      * **seeds** functions from Thumb-2 ``E92D`` (PUSH.W) prologues so analysis cascades,
+      * runs auto-analysis.
+
+    Args:
+        base: segment load address (hex). Omit to auto-derive from the GFH header.
+        thumb: Thumb-2 code (default True — MTK preloaders/DAs).
+        bits: 32 or 64 (default 32).
+        seed_prologues: seed functions from PUSH.W prologues (default True).
+        analyze: run auto-analysis afterwards (default True).
+        idb: IDB filename substring to target (optional).
+    """
+    base_expr = "None" if not base else str(int(base, 16))
+    code = (
+        "import ida_segment, ida_idp, ida_segregs, ida_bytes, ida_ua, ida_funcs, ida_auto, idaapi, struct, re\n"
+        + f"BASE={base_expr}; THUMB={bool(thumb)}; BITS={int(bits)}; SEED={bool(seed_prologues)}; ANALYZE={bool(analyze)}\n"
+        + r'''steps=[]
+seg=ida_segment.get_first_seg()
+seg.bitness = 1 if BITS==32 else (2 if BITS==64 else 0); seg.update(); steps.append("bitness=%d"%BITS)
+cur=seg.start_ea; base=BASE
+if base is None:
+    h=ida_bytes.get_bytes(cur,0x140) or b""
+    gi=h.find(b"FILE_INFO")
+    if gi>=0 and gi+36<=len(h):
+        la=struct.unpack("<I",h[gi+20:gi+24])[0]; co=struct.unpack("<I",h[gi+32:gi+36])[0]
+        base=la-co; steps.append("GFH load=%#x content=%#x -> base=%#x"%(la,co,base))
+    else:
+        base=cur; steps.append("no GFH; base kept")
+delta=base-cur
+if delta:
+    ida_segment.rebase_program(delta, ida_segment.MSF_FIXONCE); seg=ida_segment.get_first_seg(); steps.append("rebased %+#x"%delta)
+treg=ida_idp.str2reg("T")
+if treg>=0:
+    ida_segregs.set_default_sreg_value(seg, treg, 1 if THUMB else 0); steps.append("default T=%d"%(1 if THUMB else 0))
+created=0
+if SEED and treg>=0:
+    data=ida_bytes.get_bytes(seg.start_ea, seg.size()) or b""
+    for m in re.finditer(rb"\x2d\xe9", data):
+        fa=seg.start_ea+m.start()
+        if (fa & 1) or idaapi.is_code(ida_bytes.get_flags(fa)): continue
+        ida_segregs.split_sreg_range(fa, treg, 1 if THUMB else 0, ida_segregs.SR_user, True)
+        if ida_ua.create_insn(fa) and ida_funcs.add_func(fa): created+=1
+        if created>6000: break
+    steps.append("seeded %d prologues"%created)
+if ANALYZE:
+    ida_auto.plan_range(seg.start_ea, seg.end_ea); ida_auto.auto_wait(); steps.append("analyzed")
+_result={"base":hex(base),"bitness":seg.bitness,"thumb":THUMB,"funcs":idaapi.get_func_qty(),"steps":steps}
+'''
+    )
+    return _call("/execute_python", {"code": code}, idb=idb or None, timeout=300)
+
+
+@mcp.tool()
 def find_micromips_prologues(idb: str = "") -> dict:
     """Scan for microMIPS function prologues in data regions.
 
@@ -270,6 +462,69 @@ def find_micromips_prologues(idb: str = "") -> dict:
         idb: IDB filename substring to target (optional)
     """
     return _call("/find_micromips_prologues", {}, idb=idb or None)
+
+
+@mcp.tool()
+def open_file(local_path: str, remote_filename: str = "", spawn: bool = True, idb: str = "") -> dict:
+    """Upload a local binary to the remote IDA machine and open it in a new IDA instance.
+
+    The file is base64-encoded and POSTed to /upload. Two receivers are tried in order:
+
+    1. An existing IDA plugin instance (port 13337+) — works when IDA is already open.
+    2. The standalone spawn server (port 13336) — works when NO IDA is open yet.
+       Run  `python ida/spawn_server.py`  on the remote machine once to enable this.
+
+    After IDA opens and finishes auto-analysis, run --scan to find the new port,
+    then reconnect with --remote host:new_port.
+
+    Args:
+        local_path: Path to the binary on THIS machine
+        remote_filename: Filename to use on the remote (default: basename of local_path)
+        spawn: If True (default), launch a new IDA process on the uploaded file
+        idb: IDB substring to target a specific instance (optional)
+    """
+    import base64
+    import os as _os
+    fname = remote_filename or _os.path.basename(local_path)
+    try:
+        with open(local_path, "rb") as f:
+            data_b64 = base64.b64encode(f.read()).decode()
+    except OSError as e:
+        return {"error": f"Cannot read {local_path}: {e}"}
+
+    body = {"filename": fname, "data": data_b64, "spawn": spawn}
+
+    # Try existing IDA plugin first
+    result = _call("/upload", body, idb=idb or None, timeout=120)
+    if "error" not in result:
+        return result
+
+    # Fall back to standalone spawn server on port 13336 (first remote host)
+    if REMOTE:
+        _hs = _remote_hosts()
+        host = (_hs[0] if _hs else REMOTE).split(":")[0]
+        spawn_target = f"{host}:13336"
+    else:
+        spawn_target = None
+
+    if spawn_target:
+        fallback = call_remote(spawn_target, "/upload", body, timeout=120)
+        if "error" not in fallback:
+            fallback["note"] = (
+                (fallback.get("note") or "") +
+                " (via spawn_server on port 13336)"
+            )
+            return fallback
+        return {
+            "error": (
+                f"No IDA instance found and spawn server unreachable at {spawn_target}. "
+                "Run `python ida/spawn_server.py` on the remote machine first."
+            ),
+            "ida_error": result.get("error"),
+            "spawn_error": fallback.get("error"),
+        }
+
+    return result
 
 
 @mcp.tool()
@@ -782,6 +1037,40 @@ def scratch_refresh(idb: str = "") -> dict:
     return _call("/scratch_refresh", {}, idb=idb or None)
 
 
+def _scan(host: str, port_range: range = range(13337, 13400)) -> list[dict]:
+    """Probe a single host for IDA MCP plugin instances by pinging the port range."""
+    return _scan_hosts([host], port_range)
+
+
+def _scan_hosts(hosts, port_range: range = range(13337, 13361)) -> list[dict]:
+    """Probe multiple hosts' port ranges IN PARALLEL for IDA MCP instances.
+
+    Parallel so a down host (or many closed ports) doesn't serialize into a long wait; the
+    result is aggregated across every host so routing-by-idb works across the whole fleet.
+    """
+    import httpx
+    from concurrent.futures import ThreadPoolExecutor
+
+    def probe(hp):
+        host, port = hp
+        try:
+            r = httpx.get(f"http://{host}:{port}/ping", timeout=0.4)
+            info = r.json()
+            if info.get("status") == "ok":
+                return {"host": host, "port": port, "idb": info.get("idb", "?")}
+        except Exception:
+            return None
+        return None
+
+    pairs = [(h.split(":")[0], p) for h in hosts for p in port_range]
+    found = []
+    with ThreadPoolExecutor(max_workers=64) as ex:
+        for res in ex.map(probe, pairs):
+            if res:
+                found.append(res)
+    return found
+
+
 if __name__ == "__main__":
     if "--list" in sys.argv:
         instances = discover_instances(REG_DIR)
@@ -792,5 +1081,16 @@ if __name__ == "__main__":
             for inst in instances:
                 print(f"  port:{inst['port']}  pid:{inst.get('pid','?')}  idb:{inst.get('idb','?')}")
                 print(f"    path: {inst.get('idb_path', '?')}")
+    elif "--scan" in sys.argv:
+        idx = sys.argv.index("--scan")
+        host = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else "127.0.0.1"
+        print(f"Scanning {host} for IDA MCP instances (ports 13337-13399)...")
+        found = _scan(host)
+        if not found:
+            print("  None found.")
+        else:
+            for inst in found:
+                print(f"  {inst['host']}:{inst['port']}  idb:{inst['idb']}")
+            print(f"\nTo use: --remote {found[0]['host']}:{found[0]['port']}")
     else:
         mcp.run(transport="stdio")
