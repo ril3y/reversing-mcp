@@ -3,6 +3,21 @@
 These operations use the same `open_session` → `invoke` → `close_session`
 convention as the native providers.
 
+## Install and register
+
+Register the unified server for both Claude Code and Codex and install the
+optional BLE dependency with:
+
+```powershell
+python install.py --tools jadx,ble --scope user --clients claude,codex
+```
+
+The installer builds the repository's JADX bridge when needed and writes one
+`reversing-mcp` registration per selected client. Restart each client after
+registration so it reloads the MCP tool catalog. `JADX_MCP_BRIDGE_JAR` may be
+set to an existing bridge JAR to skip discovery; it is separate from REA's
+`REA_JADX_MCP_JAR` as described below.
+
 ## APK, XAPK, and bundled JavaScript
 
 Open an APK or XAPK with `provider="jadx"`. An XAPK's primary APK is selected
@@ -35,6 +50,60 @@ selected files under a session-owned temporary directory that is deleted on
 close. An explicit output directory makes the result persistent and refuses to
 overwrite existing files unless `overwrite=true`.
 
+### XAPK and uni-app example
+
+Call `open_session` for the outer XAPK and retain the returned `session_id`:
+
+```json
+{
+  "provider": "jadx",
+  "target_path": "C:\\samples\\battery-app.xapk",
+  "mode": "headless"
+}
+```
+
+Pass that ID to `invoke` to inventory the DCloud application and search every
+bundled JavaScript member, including JavaScript inside an APK nested in the
+XAPK:
+
+```json
+{
+  "session_id": "<session-id>",
+  "operation": "android.uniapp.inspect",
+  "arguments": {}
+}
+```
+
+```json
+{
+  "session_id": "<session-id>",
+  "operation": "source.search",
+  "arguments": {
+    "query": "uni.openBluetoothAdapter",
+    "context_chars": 300,
+    "limit": 25
+  }
+}
+```
+
+Use the exact `path` and `line` returned by the search to select and format the
+containing function or webpack module:
+
+```json
+{
+  "session_id": "<session-id>",
+  "operation": "source.pretty",
+  "arguments": {
+    "path": "base.apk!/assets/apps/APPID/www/app-service.js",
+    "line": 388
+  }
+}
+```
+
+Finish with `close_session({"session_id": "<session-id>"})`. A JADX session is
+read-only, but closing it is still important because it terminates the owned
+JVM and removes session-owned temporary extractions.
+
 ## Bluetooth LE
 
 Open `provider="bluetooth_le"`. `target_path` may be a BLE address or left
@@ -56,6 +125,65 @@ event includes an absolute UTC timestamp, monotonic elapsed milliseconds, hex,
 base64, size, direction, and characteristic. Closing disconnects the peripheral;
 it does not save a transcript implicitly.
 
+### BLE capture example
+
+Call `open_session` with an empty target, then scan before selecting an address:
+
+```json
+{
+  "provider": "bluetooth_le",
+  "target_path": "",
+  "mode": "headless"
+}
+```
+
+```json
+{
+  "session_id": "<session-id>",
+  "operation": "ble.scan",
+  "arguments": {"timeout": 5}
+}
+```
+
+Connect and inspect the actual characteristic properties before subscribing,
+reading, or writing:
+
+```json
+{
+  "session_id": "<session-id>",
+  "operation": "ble.connect",
+  "arguments": {"address": "<device-address>", "timeout": 20}
+}
+```
+
+```json
+{
+  "session_id": "<session-id>",
+  "operation": "ble.services.list",
+  "arguments": {}
+}
+```
+
+`ble.connect`, `ble.subscribe`, `ble.read`, and `ble.write` interact with the
+physical device. The provider never writes implicitly. Only send a frame whose
+effect is understood and authorized; a write has this shape:
+
+```json
+{
+  "session_id": "<session-id>",
+  "operation": "ble.write",
+  "arguments": {
+    "characteristic": "<writable-characteristic-uuid>",
+    "data": "010300000002c40b",
+    "response": true
+  }
+}
+```
+
+Retrieve the in-memory capture with `ble.transcript.get`, or save it explicitly
+with `ble.transcript.save` and an absolute `path`. Closing the session always
+disconnects, but does not persist the transcript.
+
 ## Checksums, Modbus RTU, and register maps
 
 Open `provider="protocol"` for offline work, or invoke the same operations on a
@@ -74,6 +202,35 @@ Bluetooth session:
 These helpers validate a hypothesis against supplied bytes; they do not by
 themselves establish that a device implements Modbus or that a register-map
 meaning is correct.
+
+### Offline Modbus example
+
+Call `open_session` without a target:
+
+```json
+{
+  "provider": "protocol",
+  "target_path": "",
+  "mode": "headless"
+}
+```
+
+Then decode a complete RTU frame:
+
+```json
+{
+  "session_id": "<session-id>",
+  "operation": "protocol.modbus.decode",
+  "arguments": {
+    "frame": "010300000002c40b",
+    "direction": "request"
+  }
+}
+```
+
+The protocol provider performs no I/O. The same protocol operations are also
+available on an open `bluetooth_le` session so captured frames can be checked
+without moving them to another tool.
 
 ## REA interoperability
 
