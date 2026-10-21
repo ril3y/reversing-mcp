@@ -24,6 +24,7 @@ from conftest import FakeBridge, bridge_registered, write_registration
 # discover_instances
 # ---------------------------------------------------------------------------
 
+
 def test_discover_returns_empty_when_dir_missing(tmp_path):
     missing = str(tmp_path / "does_not_exist")
     assert common.discover_instances(missing) == []
@@ -76,8 +77,9 @@ def test_pid_alive_does_not_signal_live_target(reg_dir):
         assert instances[0]["pid"] == proc.pid
         # Give the OS a moment, then confirm the process is STILL alive.
         time.sleep(0.1)
-        assert proc.poll() is None, \
+        assert proc.poll() is None, (
             "discover_instances must not signal the live target process"
+        )
     finally:
         proc.terminate()
         proc.wait(timeout=3)
@@ -97,6 +99,7 @@ def test_discover_ignores_corrupt_json(reg_dir):
 # resolve_instance
 # ---------------------------------------------------------------------------
 
+
 def test_resolve_returns_first_when_target_omitted(reg_dir):
     write_registration(reg_dir, port=4001, name="alpha")
     inst = common.resolve_instance(reg_dir)
@@ -108,13 +111,28 @@ def test_resolve_substring_matches_across_name_keys(reg_dir, tmp_path):
     # Write two registrations differing only in their "idb" field.
     p1 = os.path.join(reg_dir, "111111.json")
     p2 = os.path.join(reg_dir, str(os.getpid()) + ".json")
-    json.dump({"pid": os.getpid(), "port": 5001, "idb": "firmware.bin",
-               "idb_path": "/tmp/firmware.bin"}, open(p1, "w"))
-    json.dump({"pid": os.getpid(), "port": 5002, "idb": "loader.elf",
-               "idb_path": "/tmp/loader.elf"}, open(p2, "w"))
+    json.dump(
+        {
+            "pid": os.getpid(),
+            "port": 5001,
+            "idb": "firmware.bin",
+            "idb_path": "/tmp/firmware.bin",
+        },
+        open(p1, "w"),
+    )
+    json.dump(
+        {
+            "pid": os.getpid(),
+            "port": 5002,
+            "idb": "loader.elf",
+            "idb_path": "/tmp/loader.elf",
+        },
+        open(p2, "w"),
+    )
 
-    found = common.resolve_instance(reg_dir, target="loader",
-                                    name_keys=("idb", "idb_path"))
+    found = common.resolve_instance(
+        reg_dir, target="loader", name_keys=("idb", "idb_path")
+    )
     assert found is not None and found["port"] == 5002
 
 
@@ -127,6 +145,7 @@ def test_resolve_returns_none_when_no_match(reg_dir):
 # call_instance
 # ---------------------------------------------------------------------------
 
+
 def test_call_instance_no_bridges_returns_error_dict(reg_dir):
     r = common.call_instance(reg_dir, "/info", tool_name="Demo")
     assert "error" in r and "No Demo instances" in r["error"]
@@ -134,8 +153,7 @@ def test_call_instance_no_bridges_returns_error_dict(reg_dir):
 
 def test_call_instance_target_unmatched_lists_available(reg_dir):
     write_registration(reg_dir, port=4001, name="alpha")
-    r = common.call_instance(reg_dir, "/info", target="missing",
-                             tool_name="Demo")
+    r = common.call_instance(reg_dir, "/info", target="missing", tool_name="Demo")
     assert "error" in r and "Available" in r["error"]
 
 
@@ -149,8 +167,9 @@ def test_call_instance_get(fake_bridge: FakeBridge, reg_dir):
 def test_call_instance_post_sends_body(fake_bridge: FakeBridge, reg_dir):
     fake_bridge.route("/echo", lambda m, b: (200, {"got": b}))
     with bridge_registered(fake_bridge, reg_dir):
-        r = common.call_instance(reg_dir, "/echo", body={"address": "0x100"},
-                                 tool_name="Demo")
+        r = common.call_instance(
+            reg_dir, "/echo", body={"address": "0x100"}, tool_name="Demo"
+        )
     assert r == {"got": {"address": "0x100"}}
     # And the fake recorded a POST
     method = next(m for (p, m, _) in fake_bridge.calls if p == "/echo")
@@ -168,13 +187,15 @@ def test_call_instance_unlinks_registration_on_connect_error(reg_dir):
     r = common.call_instance(reg_dir, "/info", tool_name="Demo")
 
     assert "error" in r and "not responding" in r["error"]
-    assert not os.path.exists(reg_file), \
+    assert not os.path.exists(reg_file), (
         "registration file should be removed after ConnectError"
+    )
 
 
 # ---------------------------------------------------------------------------
 # list_instances_text
 # ---------------------------------------------------------------------------
+
 
 def test_list_instances_text_empty(reg_dir):
     assert "No active Demo" in common.list_instances_text(reg_dir, "Demo")

@@ -109,7 +109,8 @@ Same workflow generalizes:
 
 ### Effort
 
-**M+ to L**. ~200–300 LOC on `ida/plugin.py`, plus matching MCP wrappers.
+**M+ to L**. About 200-300 LOC on `ida/plugin.py`, plus matching adapter
+operation metadata and tests.
 Mostly mechanical once the state machine is right.
 
 ### Verification target
@@ -121,7 +122,10 @@ FX3 commands. Cross-reference against the `*_CommandHandler` string names
 already in `saleae_native/notes/dll_protocol_strings.md` to map opcode
 bytes → command names.
 
-## IDA bridge (`ida/plugin.py` + `ida/mcp_server.py`)
+## IDA bridge and adapter
+
+The implementation spans `ida/plugin.py` and
+`reversing_mcp/providers/local_bridges.py`.
 
 The most-developed bridge. Surface is solid for static work, gaps are around iteration ergonomics.
 
@@ -137,7 +141,10 @@ The most-developed bridge. Surface is solid for static work, gaps are around ite
 
 ## Ghidra bridge (`ghidra/`)
 
-Has the original IDA surface but **not the new endpoints we added in this branch** (`define_type`, `apply_type`, `set_function_prototype`, `add_segment`, `set_segment_attrs`). The MCP wrappers are 1:1 mirrors — the gap is on the Java/Ghidra side.
+Has the original IDA surface but **not the new endpoints we added in this
+branch** (`define_type`, `apply_type`, `set_function_prototype`,
+`add_segment`, `set_segment_attrs`). The unified adapter already has a
+common operation contract; this gap is on the Java/Ghidra bridge side.
 
 | # | Endpoint | Why | Sketch | Effort |
 |---|---|---|---|---|
@@ -193,9 +200,10 @@ codifying as cookbook recipes or meta-tools:
 
 ### IDA static → Unicorn emulation (no new bridge code required)
 
-Pull a function's bytes via `ida.get_bytes`, map + load into Unicorn,
+Pull a function's bytes with unified `invoke(..., "memory.read", ...)`, map
+and load them into Unicorn,
 write registers, run, observe. ~8 MCP calls today; works on the existing
-servers. Killer apps:
+provider sessions. Killer apps:
 
 - Validate struct-field hypotheses without re-decompiling.
 - Crypto/hash function discovery: emulate with known inputs, check
@@ -218,8 +226,8 @@ Three legs of the stool: **static IDA + IDA debugger + Unicorn**.
 
 ### Meta-tool: `emulate_function(idb, address, arch_instance, inputs)`
 
-Once the unified `reversing_mcp.py` lands (cross-cutting item #23), it
-can expose meta-tools that bridge across servers in one call:
+The unified `reversing_mcp` package can expose future meta-tools that
+compose provider sessions in one call:
 
 ```python
 emulate_function(
@@ -238,8 +246,8 @@ Effort: **S** once the unified server is in place.
 
 | # | Item | Why | Effort |
 |---|---|---|---|
-| 23 | **Unified `reversing_mcp.py`** | One stdio MCP server replacing the per-tool ones. User installs one entry in Claude Code instead of five; cross-tool meta-tools (`compare_ida_vs_ghidra_decompile(addr)`) become possible. Bridges-in-tools layer is unchanged. | M |
-| 24 | **`version_info` MCP tool + 24h GitHub Releases cache** | The MCP can tell the user "an update is available" opportunistically. ~50 LOC in `common.py` + one tool wrapper. | S |
+| 23 | **Unified `reversing_mcp` package** | Shipped. One stdio server owns lifecycle, capability discovery, and provider sessions. Cross-provider meta-tools remain future work. | Done |
+| 24 | **`version_info` MCP tool + 24h GitHub Releases cache** | The server can tell the user "an update is available" opportunistically. Add the tool to the unified surface and keep release lookup separate from provider adapters. | S |
 | 25 | **`install.py --update`** | `git pull` + re-run build/deploy for already-installed tools. Idempotent. | S |
 | 26 | **GitHub Actions release pipeline** | Tag push (`v*`) → CI builds jadx fat JAR + ILSpy bin + Ghidra ZIP (if a Ghidra dir is provided as a workflow input) → attaches to release. Lets `install.py --update` pull binaries instead of building locally. | M |
 | 27 | **x64dbg integration** | New `x64dbg/` bridge using `~/Desktop/x64debug/pluginsdk/`. Surface: `attach/detach/run/step_*/breakpoints/regs/memory/callstack/run_command`. Dynamic debug complements static IDA/Ghidra perfectly. | L |
@@ -300,5 +308,6 @@ Effort: **S** once the unified server is in place.
 - `define_type`, `apply_type`, `set_function_prototype`, `add_segment`, `set_segment_attrs` on the IDA bridge. (`cb84048` ish)
 - Modal-dialog watchdog + `idc.batch(1)` per-handler wrapping in `_MainThreadTimer._tick`.
 - Windows-safe PID liveness check in `common.py` (do not regress this — it killed a live IDA during dev).
-- `install.py` interactive installer with build+deploy+register actions for all five tools.
+- `install.py` interactive installer with provider build/deploy and one
+  unified MCP registration for Claude Code and Codex.
 - `unicorn` and `saleae` branches pushed, not merged.

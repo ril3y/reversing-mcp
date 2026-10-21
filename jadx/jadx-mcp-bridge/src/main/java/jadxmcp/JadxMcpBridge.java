@@ -1,5 +1,5 @@
 // Entry point: load an APK/JAR/DEX into jadx, start an HTTP server, register
-// in ~/.jadx_mcp/<pid>.json so jadx/mcp_server.py can discover it.
+// in ~/.jadx_mcp/<pid>.json so the unified JADX provider can discover it.
 //
 //   java -jar jadx-mcp-bridge.jar <input-file> [--port=N]
 package jadxmcp;
@@ -28,6 +28,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 public final class JadxMcpBridge {
 
@@ -99,7 +101,13 @@ public final class JadxMcpBridge {
             Json.num("pid", pid),
             Json.num("port", port),
             Json.str("jar", input.getName()),
-            Json.str("jar_path", input.getAbsolutePath())
+            Json.str("jar_path", input.getAbsolutePath()),
+            Json.str("session_id", "jadx-" + pid),
+            Json.str("provider_id", "jadx"),
+            Json.str("protocol_version", "1.0"),
+            Json.str("mode", "headless"),
+            Json.bool("owned", true),
+            Json.bool("read_only", true)
         );
         Path reg = dir.resolve(pid + ".json");
         Files.writeString(reg, json);
@@ -123,6 +131,11 @@ public final class JadxMcpBridge {
             try {
                 String resp = route(path, ex);
                 send(ex, 200, resp);
+                if ("/close".equals(path)) {
+                    Thread shutdown = new Thread(() -> System.exit(0), "jadx-mcp-close");
+                    shutdown.setDaemon(false);
+                    shutdown.start();
+                }
             } catch (BadRequest br) {
                 send(ex, 400, Json.error(br.getMessage()));
             } catch (Throwable t) {
@@ -137,12 +150,23 @@ public final class JadxMcpBridge {
                 case "/ping":
                     return Json.object(Json.str("status", "ok"),
                                        Json.str("jar", svc.getInputFile().getName()));
+                case "/capabilities":
+                    return capabilities();
                 case "/info":
                     return Json.object(
                         Json.str("jar", svc.getInputFile().getName()),
                         Json.str("path", svc.getInputFile().getAbsolutePath()),
+                        Json.str("input_kind", inputKind()),
+                        Json.bool("android", isAndroidInput()),
+                        Json.bool("read_only", true),
                         Json.num("classes", svc.classCount()),
                         Json.num("methods", svc.methodCount())
+                    );
+                case "/close":
+                    return Json.object(
+                        Json.bool("success", true),
+                        Json.str("provider_id", "jadx"),
+                        Json.str("effect", "owned_session_closed")
                     );
                 case "/list_classes":
                     return listClasses(body);
@@ -160,12 +184,81 @@ public final class JadxMcpBridge {
                     return searchStrings(body);
                 case "/xrefs_to":
                     return xrefsTo(body);
+                case "/list_resources":
+                    return listResources(body);
                 default:
                     throw new BadRequest("Unknown endpoint: " + path);
             }
         }
 
         // ------ endpoint handlers ------
+
+        private String capabilities() {
+            List<String> supported = List.of(
+                "lifecycle.create", "lifecycle.open", "lifecycle.close",
+                "target.info", "android.classes.list", "android.classes.search",
+                "analysis.decompile", "android.methods.list", "search.strings", "analysis.xrefs",
+                "android.resources.list"
+            ).stream().map(value -> "\"" + Json.esc(value) + "\"").toList();
+            List<String> unsupported = List.of(
+                Json.object(
+                    Json.str("id", "lifecycle.save"),
+                    Json.str("reason", "JADX has no mutable analysis database.")),
+                Json.object(
+                    Json.str("id", "script.python"),
+                    Json.str("reason", "The JVM bridge does not embed a Python runtime.")),
+                Json.object(
+                    Json.str("id", "comments.write"),
+                    Json.str("reason", "JADX sessions are read-only."))
+            );
+            return Json.object(
+                Json.str("protocol_version", "1.0"),
+                Json.str("provider_id", "jadx"),
+                Json.str("mode", "headless"),
+                Json.bool("owned", true),
+                Json.bool("read_only", true),
+                Json.raw("supported", Json.array(supported)),
+                Json.raw("unsupported", Json.array(unsupported))
+            );
+        }
+
+        private boolean isAndroidInput() {
+            String name = svc.getInputFile().getName().toLowerCase();
+            return name.endsWith(".apk") || name.endsWith(".dex") || name.endsWith(".aab");
+        }
+
+        private String inputKind() {
+            String name = svc.getInputFile().getName().toLowerCase();
+            if (name.endsWith(".apk")) return "apk";
+            if (name.endsWith(".aab")) return "aab";
+            if (name.endsWith(".dex")) return "dex";
+            if (name.endsWith(".jar")) return "jar";
+            return "managed_archive";
+        }
+
+        private String listResources(Map<String, String> body) throws IOException {
+            String prefix = body.getOrDefault("prefix", "");
+            int limit = Math.max(1, Math.min(parseInt(body.get("limit"), 500), 5000));
+            List<String> entries = new ArrayList<>();
+            try (ZipFile zip = new ZipFile(svc.getInputFile())) {
+                var iterator = zip.entries().asIterator();
+                while (iterator.hasNext() && entries.size() < limit) {
+                    ZipEntry entry = iterator.next();
+                    if (!entry.getName().startsWith(prefix)) continue;
+                    entries.add(Json.object(
+                        Json.str("path", entry.getName()),
+                        Json.num("size", entry.getSize()),
+                        Json.num("compressed_size", entry.getCompressedSize()),
+                        Json.bool("directory", entry.isDirectory())
+                    ));
+                }
+            }
+            return Json.object(
+                Json.raw("resources", Json.array(entries)),
+                Json.num("count", entries.size()),
+                Json.bool("truncated", entries.size() >= limit)
+            );
+        }
 
         private String listClasses(Map<String, String> body) {
             String prefix = body.getOrDefault("prefix", "");

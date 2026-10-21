@@ -1,7 +1,8 @@
 // GhidraScript that starts an embedded HTTP server for MCP integration.
 //
-// Install: Place in your ghidra_scripts directory and run from Script Manager.
-// Each Ghidra instance gets its own port and registers in ~/.ghidra_mcp/.
+// Used by the unified provider as an analyzeHeadless post-script. It can also
+// run from Script Manager for diagnostics. Each instance registers in
+// ~/.ghidra_mcp/.
 //
 // The script keeps running (blocks via askYesNo) so the HTTP server stays alive.
 // Click "No" on the dialog to stop the server.
@@ -13,12 +14,12 @@ import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpExchange;
 
+import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileOptions;
 import ghidra.app.decompiler.DecompileResults;
-import ghidra.app.script.GhidraScript;
-import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
+import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressFactory;
 import ghidra.program.model.address.AddressSet;
@@ -39,7 +40,9 @@ import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ghidra_mcp_bridge extends GhidraScript {
 
@@ -48,8 +51,11 @@ public class ghidra_mcp_bridge extends GhidraScript {
     private static final int MAX_PORT = 13500;
 
     private HttpServer server;
+    private ExecutorService serverExecutor;
     private DecompInterface decompiler;
     private int serverPort;
+    private boolean headlessMode;
+    private final AtomicBoolean stopRequested = new AtomicBoolean(false);
 
     @Override
     public void run() throws Exception {
@@ -57,6 +63,8 @@ public class ghidra_mcp_bridge extends GhidraScript {
             println("[MCP] No program loaded. Open a binary first.");
             return;
         }
+
+        headlessMode = Arrays.asList(getScriptArgs()).contains("--headless-owned");
 
         // Initialize decompiler
         decompiler = new DecompInterface();
@@ -69,10 +77,12 @@ public class ghidra_mcp_bridge extends GhidraScript {
         // Find free port and start server
         serverPort = findFreePort();
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", serverPort), 0);
-        server.setExecutor(Executors.newFixedThreadPool(4));
+        serverExecutor = Executors.newFixedThreadPool(4);
+        server.setExecutor(serverExecutor);
 
         // Register all endpoints
         server.createContext("/ping", new PingHandler());
+        server.createContext("/capabilities", new CapabilitiesHandler());
         server.createContext("/info", new InfoHandler());
         server.createContext("/segments", new SegmentsHandler());
         server.createContext("/function", new FunctionHandler());
@@ -87,34 +97,42 @@ public class ghidra_mcp_bridge extends GhidraScript {
         server.createContext("/bytes", new BytesHandler());
         server.createContext("/rename", new RenameHandler());
         server.createContext("/comment", new CommentHandler());
-        server.createContext("/create_function", new CreateFunctionHandler());
-        server.createContext("/delete_function", new DeleteFunctionHandler());
         server.createContext("/set_segment_perms", new SetSegmentPermsHandler());
         server.createContext("/analyze_range", new AnalyzeRangeHandler());
-
-        server.start();
-        String regPath = register(serverPort);
-
-        println("[MCP] Server started on http://127.0.0.1:" + serverPort);
-        println("[MCP] Program: " + currentProgram.getName());
-        println("[MCP] Registration: " + regPath);
+        server.createContext("/create_function", new CreateFunctionHandler());
+        server.createContext("/delete_function", new DeleteFunctionHandler());
+        server.createContext("/save", new SaveHandler());
+        server.createContext("/close", new CloseHandler());
 
         try {
-            // Block until user dismisses
-            boolean keepRunning = askYesNo("Ghidra MCP Server",
-                "MCP server running on port " + serverPort + ".\n" +
-                "Program: " + currentProgram.getName() + "\n\n" +
-                "Click 'No' to stop the server.");
+            server.start();
+            String regPath = register(serverPort);
 
-            // If they click Yes, show another dialog (loop)
-            while (keepRunning) {
-                keepRunning = askYesNo("Ghidra MCP Server",
-                    "MCP server still running on port " + serverPort + ".\n" +
+            println("[MCP] Server started on http://127.0.0.1:" + serverPort);
+            println("[MCP] Program: " + currentProgram.getName());
+            println("[MCP] Registration: " + regPath);
+
+            if (headlessMode) {
+                while (!stopRequested.get() && !monitor.isCancelled()) {
+                    Thread.sleep(100);
+                }
+            } else {
+                // Block until user dismisses
+                boolean keepRunning = askYesNo("Ghidra MCP Server",
+                    "MCP server running on port " + serverPort + ".\n" +
+                    "Program: " + currentProgram.getName() + "\n\n" +
                     "Click 'No' to stop the server.");
+
+                while (keepRunning) {
+                    keepRunning = askYesNo("Ghidra MCP Server",
+                        "MCP server still running on port " + serverPort + ".\n" +
+                        "Click 'No' to stop the server.");
+                }
             }
         } finally {
             // Cleanup
-            server.stop(0);
+            if (server != null) server.stop(0);
+            if (serverExecutor != null) serverExecutor.shutdownNow();
             unregister();
             if (decompiler != null) {
                 decompiler.dispose();
@@ -154,7 +172,13 @@ public class ghidra_mcp_bridge extends GhidraScript {
             "  \"pid\": " + pid + ",\n" +
             "  \"port\": " + port + ",\n" +
             "  \"program\": \"" + escapeJson(currentProgram.getName()) + "\",\n" +
-            "  \"program_path\": \"" + escapeJson(programPath) + "\"\n" +
+            "  \"program_path\": \"" + escapeJson(programPath) + "\",\n" +
+            "  \"session_id\": \"ghidra-" + pid + "\",\n" +
+            "  \"provider_id\": \"ghidra\",\n" +
+            "  \"protocol_version\": \"1.0\",\n" +
+            "  \"mode\": \"" + (headlessMode ? "headless" : "gui") + "\",\n" +
+            "  \"owned\": " + headlessMode + ",\n" +
+            "  \"read_only\": false\n" +
             "}";
 
         Path regFile = dir.resolve(pid + ".json");
@@ -290,7 +314,7 @@ public class ghidra_mcp_bridge extends GhidraScript {
     // Address parsing
     // -----------------------------------------------------------------------
 
-    private Address parseAddress(String addrStr) {
+    private Address parseMcpAddress(String addrStr) {
         if (addrStr == null || addrStr.isEmpty()) return null;
         addrStr = addrStr.trim();
         if (addrStr.startsWith("0x") || addrStr.startsWith("0X")) {
@@ -498,12 +522,12 @@ public class ghidra_mcp_bridge extends GhidraScript {
 
     private String getXrefsTo(Address addr) {
         ReferenceManager refMgr = currentProgram.getReferenceManager();
-        Reference[] refs = refMgr.getReferencesTo(addr);
-
         StringBuilder sb = new StringBuilder();
         sb.append("{\"refs\": [");
         boolean first = true;
-        for (Reference ref : refs) {
+        ReferenceIterator refs = refMgr.getReferencesTo(addr);
+        while (refs.hasNext()) {
+            Reference ref = refs.next();
             if (!first) sb.append(", ");
             first = false;
 
@@ -558,8 +582,9 @@ public class ghidra_mcp_bridge extends GhidraScript {
         Set<String> seen = new LinkedHashSet<>();
         List<String> callerEntries = new ArrayList<>();
 
-        Reference[] refs = refMgr.getReferencesTo(func.getEntryPoint());
-        for (Reference ref : refs) {
+        ReferenceIterator refs = refMgr.getReferencesTo(func.getEntryPoint());
+        while (refs.hasNext()) {
+            Reference ref = refs.next();
             if (!ref.getReferenceType().isCall() && !ref.getReferenceType().isJump()) continue;
 
             Function callerFunc = currentProgram.getListing().getFunctionContaining(ref.getFromAddress());
@@ -715,6 +740,7 @@ public class ghidra_mcp_bridge extends GhidraScript {
         }
 
         if (success) {
+            saveAfterMutation();
             println("[MCP] RENAME " + formatAddress(addr) + ": " + oldName + " -> " + newName);
         }
 
@@ -747,6 +773,7 @@ public class ghidra_mcp_bridge extends GhidraScript {
 
         String ctype = repeatable ? "repeatable" : "regular";
         if (success) {
+            saveAfterMutation();
             println("[MCP] COMMENT " + formatAddress(addr) + " (" + ctype + "): " +
                     comment.substring(0, Math.min(comment.length(), 80)));
         }
@@ -781,6 +808,9 @@ public class ghidra_mcp_bridge extends GhidraScript {
             currentProgram.endTransaction(txId, success);
         }
 
+        if (success) {
+            saveAfterMutation();
+        }
         StringBuilder sb = new StringBuilder();
         sb.append("{");
         sb.append(jsonPair("success", success)).append(", ");
@@ -810,7 +840,8 @@ public class ghidra_mcp_bridge extends GhidraScript {
         boolean success = false;
         int txId = currentProgram.startTransaction("MCP Delete Function");
         try {
-            success = currentProgram.getListing().removeFunction(addr);
+            currentProgram.getListing().removeFunction(addr);
+            success = true;
         } catch (Exception e) {
             println("[MCP] DELETE FUNC FAILED " + formatAddress(addr) + ": " + e.getMessage());
         } finally {
@@ -818,6 +849,7 @@ public class ghidra_mcp_bridge extends GhidraScript {
         }
 
         if (success) {
+            saveAfterMutation();
             println("[MCP] DELETE FUNC " + formatAddress(addr) + " (" + name + ")");
         }
 
@@ -829,86 +861,75 @@ public class ghidra_mcp_bridge extends GhidraScript {
         return sb.toString();
     }
 
-    private String setSegmentPerms(Address addr, String permStr) {
+    private String setSegmentPerms(Address addr, String requestedPerms) {
         MemoryBlock block = currentProgram.getMemory().getBlock(addr);
         if (block == null) {
             return "{" + jsonPair("success", false) + ", " +
-                   jsonPair("error", "No memory block at " + formatAddress(addr)) + "}";
+                jsonPair("error", "No memory block at " + formatAddress(addr)) + "}";
         }
-        String permU = permStr.toUpperCase();
-        boolean wantR = permU.contains("R");
-        boolean wantW = permU.contains("W");
-        boolean wantX = permU.contains("X");
+
+        String normalized = requestedPerms.toUpperCase();
+        boolean wantRead = normalized.contains("R");
+        boolean wantWrite = normalized.contains("W");
+        boolean wantExecute = normalized.contains("X");
         boolean success = false;
-        int txId = currentProgram.startTransaction("MCP Set Block Permissions");
+        int transaction = currentProgram.startTransaction("MCP Set Block Perms");
         try {
-            block.setRead(wantR);
-            block.setWrite(wantW);
-            block.setExecute(wantX);
+            block.setRead(wantRead);
+            block.setWrite(wantWrite);
+            block.setExecute(wantExecute);
             success = true;
         } catch (Exception e) {
             println("[MCP] SET PERMS FAILED " + block.getName() + ": " + e.getMessage());
         } finally {
-            currentProgram.endTransaction(txId, success);
+            currentProgram.endTransaction(transaction, success);
         }
 
         String perms = "";
         if (block.isRead()) perms += "R";
         if (block.isWrite()) perms += "W";
         if (block.isExecute()) perms += "X";
-
         if (success) {
+            saveAfterMutation();
             println("[MCP] SET PERMS " + block.getName() + " = " + perms);
         }
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("{");
-        sb.append(jsonPair("success", success)).append(", ");
-        sb.append(jsonPair("block", block.getName())).append(", ");
-        sb.append(jsonPair("start", formatAddress(block.getStart()))).append(", ");
-        sb.append(jsonPair("end", formatAddress(block.getEnd()))).append(", ");
-        sb.append(jsonPair("perms", perms));
-        sb.append("}");
-        return sb.toString();
+        return "{" + jsonPair("success", success) + ", " +
+            jsonPair("block", block.getName()) + ", " +
+            jsonPair("start", formatAddress(block.getStart())) + ", " +
+            jsonPair("end", formatAddress(block.getEnd())) + ", " +
+            jsonPair("perms", perms) + "}";
     }
 
     private String analyzeRange(Address start, Address end) {
         boolean success = false;
-        long bytesAnalyzed = 0;
-        int txId = currentProgram.startTransaction("MCP Analyze Range");
+        long byteCount = 0;
+        int transaction = currentProgram.startTransaction("MCP Analyze Range");
         try {
-            // Disassemble the range first; AutoAnalysisManager will pick it up
-            AddressSet rangeSet = new AddressSet(start, end);
-            DisassembleCommand cmd = new DisassembleCommand(rangeSet, null, true);
-            cmd.applyTo(currentProgram, monitor);
-            // Now flush pending analysis
-            AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(currentProgram);
-            if (mgr != null) {
-                mgr.startAnalysis(monitor);
-                mgr.waitForAnalysis(null, monitor);
+            AddressSet range = new AddressSet(start, end);
+            DisassembleCommand command = new DisassembleCommand(range, null, true);
+            command.applyTo(currentProgram, TaskMonitor.DUMMY);
+            AutoAnalysisManager manager =
+                AutoAnalysisManager.getAnalysisManager(currentProgram);
+            if (manager != null) {
+                manager.startAnalysis(TaskMonitor.DUMMY);
+                manager.waitForAnalysis(null, TaskMonitor.DUMMY);
             }
-            bytesAnalyzed = rangeSet.getNumAddresses();
+            byteCount = range.getNumAddresses();
             success = true;
         } catch (Exception e) {
-            println("[MCP] ANALYZE RANGE FAILED " + formatAddress(start) +
-                    "-" + formatAddress(end) + ": " + e.getMessage());
+            println("[MCP] ANALYZE RANGE FAILED: " + e.getMessage());
         } finally {
-            currentProgram.endTransaction(txId, success);
+            currentProgram.endTransaction(transaction, success);
         }
-
         if (success) {
+            saveAfterMutation();
             println("[MCP] ANALYZE RANGE " + formatAddress(start) + "-" +
-                    formatAddress(end) + " (" + bytesAnalyzed + " bytes)");
+                formatAddress(end) + " (" + byteCount + " bytes)");
         }
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("{");
-        sb.append(jsonPair("success", success)).append(", ");
-        sb.append(jsonPair("start", formatAddress(start))).append(", ");
-        sb.append(jsonPair("end", formatAddress(end))).append(", ");
-        sb.append(jsonPair("bytes", bytesAnalyzed));
-        sb.append("}");
-        return sb.toString();
+        return "{" + jsonPair("success", success) + ", " +
+            jsonPair("start", formatAddress(start)) + ", " +
+            jsonPair("end", formatAddress(end)) + ", " +
+            jsonPair("bytes", byteCount) + "}";
     }
 
     // -----------------------------------------------------------------------
@@ -921,6 +942,71 @@ public class ghidra_mcp_bridge extends GhidraScript {
             sb.append(String.format("%02x", b & 0xFF));
         }
         return sb.toString();
+    }
+
+    private String capabilitiesJson() {
+        String[] supported = {
+            "lifecycle.attach", "lifecycle.save",
+            "target.info", "segments.list", "functions.get", "functions.list",
+            "analysis.disassemble", "analysis.decompile", "analysis.xrefs",
+            "analysis.range", "segments.update",
+            "callgraph.callers", "callgraph.callees", "search.functions",
+            "search.strings", "memory.read",
+            "symbols.rename", "comments.write", "functions.create", "functions.delete"
+        };
+        List<String> values = new ArrayList<>();
+        for (String item : supported) {
+            values.add("\"" + escapeJson(item) + "\"");
+        }
+        if (headlessMode) {
+            values.add("\"lifecycle.create\"");
+            values.add("\"lifecycle.open\"");
+            values.add("\"lifecycle.close\"");
+        }
+        String closeReason = headlessMode
+            ? ""
+            : ", {\"id\":\"lifecycle.close\",\"reason\":\"GUI sessions are user-owned.\"}";
+        return "{" +
+            jsonPair("protocol_version", "1.0") + ", " +
+            jsonPair("provider_id", "ghidra") + ", " +
+            jsonPair("mode", headlessMode ? "headless" : "gui") + ", " +
+            jsonPair("owned", headlessMode) + ", " +
+            jsonPair("read_only", false) + ", " +
+            "\"supported\":[" + String.join(",", values) + "], " +
+            "\"unsupported\":[" +
+            "{\"id\":\"script.python\",\"reason\":\"The Java bridge does not embed a Python runtime.\"}" +
+            closeReason + "]}";
+    }
+
+    private String saveProgram() {
+        if (headlessMode) {
+            return "{" + jsonPair("success", true) + ", " +
+                jsonPair("persisted", false) + ", " +
+                jsonPair("deferred_until_close", true) + ", " +
+                jsonPair("reason", "analyzeHeadless owns an outer transaction") + "}";
+        }
+        try {
+            if (!currentProgram.canSave()) {
+                return "{" + jsonPair("success", false) + ", " +
+                    jsonPair("error", "program_not_savable") + "}";
+            }
+            currentProgram.save("MCP save", monitor);
+            return "{" + jsonPair("success", true) + ", " +
+                jsonPair("provider_id", "ghidra") + ", " +
+                jsonPair("program", currentProgram.getName()) + "}";
+        } catch (Exception e) {
+            return "{" + jsonPair("success", false) + ", " +
+                jsonPair("error", e.getClass().getSimpleName() + ": " + e.getMessage()) + "}";
+        }
+    }
+
+    private void saveAfterMutation() {
+        if (headlessMode) {
+            String result = saveProgram();
+            if (result.contains("\"success\": false")) {
+                println("[MCP] Automatic save failed: " + result);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -950,6 +1036,41 @@ public class ghidra_mcp_bridge extends GhidraScript {
         }
     }
 
+    private class CapabilitiesHandler extends BaseHandler {
+        void handleRequest(HttpExchange exchange) throws Exception {
+            respond(exchange, capabilitiesJson());
+        }
+    }
+
+    private class SaveHandler extends BaseHandler {
+        void handleRequest(HttpExchange exchange) throws Exception {
+            respond(exchange, saveProgram());
+        }
+    }
+
+    private class CloseHandler extends BaseHandler {
+        void handleRequest(HttpExchange exchange) throws Exception {
+            if (!headlessMode) {
+                respond(exchange, "{" + jsonPair("error", "unsupported_capability") + ", " +
+                    jsonPair("capability", "lifecycle.close") + ", " +
+                    jsonPair("reason", "GUI sessions are user-owned.") + "}", 409);
+                return;
+            }
+            Map<String, String> body = parseJsonBody(exchange);
+            boolean save = !"false".equalsIgnoreCase(body.get("save"));
+            if (!save) {
+                respond(exchange, "{" + jsonPair("error", "unsupported_capability") + ", " +
+                    jsonPair("capability", "lifecycle.close_without_save") + ", " +
+                    jsonPair("reason", "analyzeHeadless commits the script transaction when it exits.") + "}", 409);
+                return;
+            }
+            respond(exchange, "{" + jsonPair("success", true) + ", " +
+                jsonPair("saved", true) + ", " +
+                jsonPair("effect", "owned_session_closed") + "}");
+            stopRequested.set(true);
+        }
+    }
+
     private class InfoHandler extends BaseHandler {
         void handleRequest(HttpExchange exchange) throws Exception {
             respond(exchange, getProgramInfo());
@@ -962,6 +1083,49 @@ public class ghidra_mcp_bridge extends GhidraScript {
         }
     }
 
+    private class SetSegmentPermsHandler extends BaseHandler {
+        void handleRequest(HttpExchange exchange) throws Exception {
+            Map<String, String> body = parseJsonBody(exchange);
+            String addressText = body.get("address");
+            String perms = body.get("perms");
+            if (addressText == null || addressText.isEmpty()) {
+                respondError(exchange, "Provide 'address'", 400);
+                return;
+            }
+            if (perms == null) {
+                respondError(exchange, "Provide 'perms' (e.g. 'RX')", 400);
+                return;
+            }
+            Address address = parseMcpAddress(addressText);
+            if (address == null) {
+                respond(exchange, "{" + jsonPair("success", false) + ", " +
+                    jsonPair("error", "Invalid address") + "}");
+                return;
+            }
+            respond(exchange, setSegmentPerms(address, perms));
+        }
+    }
+
+    private class AnalyzeRangeHandler extends BaseHandler {
+        void handleRequest(HttpExchange exchange) throws Exception {
+            Map<String, String> body = parseJsonBody(exchange);
+            String startText = body.get("start");
+            String endText = body.get("end");
+            if (startText == null || endText == null) {
+                respondError(exchange, "Provide 'start' and 'end'", 400);
+                return;
+            }
+            Address start = parseMcpAddress(startText);
+            Address end = parseMcpAddress(endText);
+            if (start == null || end == null) {
+                respond(exchange, "{" + jsonPair("success", false) + ", " +
+                    jsonPair("error", "Invalid address") + "}");
+                return;
+            }
+            respond(exchange, analyzeRange(start, end));
+        }
+    }
+
     private class FunctionHandler extends BaseHandler {
         void handleRequest(HttpExchange exchange) throws Exception {
             Map<String, String> body = parseJsonBody(exchange);
@@ -970,7 +1134,7 @@ public class ghidra_mcp_bridge extends GhidraScript {
 
             Function func = null;
             if (addrStr != null && !addrStr.isEmpty()) {
-                Address addr = parseAddress(addrStr);
+                Address addr = parseMcpAddress(addrStr);
                 if (addr != null) {
                     func = currentProgram.getListing().getFunctionAt(addr);
                     if (func == null) {
@@ -1001,8 +1165,8 @@ public class ghidra_mcp_bridge extends GhidraScript {
             String endStr = body.get("end");
 
             if (startStr != null && endStr != null) {
-                Address start = parseAddress(startStr);
-                Address end = parseAddress(endStr);
+                Address start = parseMcpAddress(startStr);
+                Address end = parseMcpAddress(endStr);
                 if (start != null && end != null) {
                     respond(exchange, disassembleRange(start, end));
                 } else {
@@ -1019,7 +1183,7 @@ public class ghidra_mcp_bridge extends GhidraScript {
                     return;
                 }
             } else if (addrStr != null && !addrStr.isEmpty()) {
-                Address addr = parseAddress(addrStr);
+                Address addr = parseMcpAddress(addrStr);
                 if (addr != null) {
                     func = currentProgram.getListing().getFunctionAt(addr);
                     if (func == null) {
@@ -1050,7 +1214,7 @@ public class ghidra_mcp_bridge extends GhidraScript {
                     return;
                 }
             } else if (addrStr != null && !addrStr.isEmpty()) {
-                Address addr = parseAddress(addrStr);
+                Address addr = parseMcpAddress(addrStr);
                 if (addr != null) {
                     func = currentProgram.getListing().getFunctionAt(addr);
                     if (func == null) {
@@ -1085,7 +1249,7 @@ public class ghidra_mcp_bridge extends GhidraScript {
                 }
                 addr = func.getEntryPoint();
             } else if (addrStr != null && !addrStr.isEmpty()) {
-                addr = parseAddress(addrStr);
+                addr = parseMcpAddress(addrStr);
             }
 
             if (addr == null) {
@@ -1107,7 +1271,7 @@ public class ghidra_mcp_bridge extends GhidraScript {
                 return;
             }
 
-            Address addr = parseAddress(addrStr);
+            Address addr = parseMcpAddress(addrStr);
             if (addr == null) {
                 respondError(exchange, "Invalid address", 400);
                 return;
@@ -1127,7 +1291,7 @@ public class ghidra_mcp_bridge extends GhidraScript {
             if (name != null && !name.isEmpty()) {
                 func = findFunctionByName(name);
             } else if (addrStr != null && !addrStr.isEmpty()) {
-                Address addr = parseAddress(addrStr);
+                Address addr = parseMcpAddress(addrStr);
                 if (addr != null) {
                     func = currentProgram.getListing().getFunctionAt(addr);
                     if (func == null) {
@@ -1155,7 +1319,7 @@ public class ghidra_mcp_bridge extends GhidraScript {
             if (name != null && !name.isEmpty()) {
                 func = findFunctionByName(name);
             } else if (addrStr != null && !addrStr.isEmpty()) {
-                Address addr = parseAddress(addrStr);
+                Address addr = parseMcpAddress(addrStr);
                 if (addr != null) {
                     func = currentProgram.getListing().getFunctionAt(addr);
                     if (func == null) {
@@ -1208,7 +1372,7 @@ public class ghidra_mcp_bridge extends GhidraScript {
                 return;
             }
 
-            Address addr = parseAddress(addrStr);
+            Address addr = parseMcpAddress(addrStr);
             if (addr == null) {
                 respondError(exchange, "Invalid address", 400);
                 return;
@@ -1238,7 +1402,7 @@ public class ghidra_mcp_bridge extends GhidraScript {
                 return;
             }
 
-            Address addr = parseAddress(addrStr);
+            Address addr = parseMcpAddress(addrStr);
             if (addr == null) {
                 respondError(exchange, "Invalid address", 400);
                 return;
@@ -1260,7 +1424,7 @@ public class ghidra_mcp_bridge extends GhidraScript {
                 return;
             }
 
-            Address addr = parseAddress(addrStr);
+            Address addr = parseMcpAddress(addrStr);
             if (addr == null) {
                 respondError(exchange, "Invalid address", 400);
                 return;
@@ -1282,13 +1446,13 @@ public class ghidra_mcp_bridge extends GhidraScript {
                 return;
             }
 
-            Address addr = parseAddress(addrStr);
+            Address addr = parseMcpAddress(addrStr);
             if (addr == null) {
                 respondError(exchange, "Invalid address", 400);
                 return;
             }
 
-            Address end = (endStr != null && !endStr.isEmpty()) ? parseAddress(endStr) : null;
+            Address end = (endStr != null && !endStr.isEmpty()) ? parseMcpAddress(endStr) : null;
             respond(exchange, createFunction(addr, end));
         }
     }
@@ -1303,60 +1467,13 @@ public class ghidra_mcp_bridge extends GhidraScript {
                 return;
             }
 
-            Address addr = parseAddress(addrStr);
+            Address addr = parseMcpAddress(addrStr);
             if (addr == null) {
                 respondError(exchange, "Invalid address", 400);
                 return;
             }
 
             respond(exchange, deleteFunction(addr));
-        }
-    }
-
-    private class SetSegmentPermsHandler extends BaseHandler {
-        void handleRequest(HttpExchange exchange) throws Exception {
-            Map<String, String> body = parseJsonBody(exchange);
-            String addrStr = body.get("address");
-            String permStr = body.get("perms");
-
-            if (addrStr == null || addrStr.isEmpty()) {
-                respondError(exchange, "Provide 'address'", 400);
-                return;
-            }
-            if (permStr == null) {
-                respondError(exchange, "Provide 'perms' (e.g. 'RX', 'RWX', 'R')", 400);
-                return;
-            }
-
-            Address addr = parseAddress(addrStr);
-            if (addr == null) {
-                respondError(exchange, "Invalid address", 400);
-                return;
-            }
-
-            respond(exchange, setSegmentPerms(addr, permStr));
-        }
-    }
-
-    private class AnalyzeRangeHandler extends BaseHandler {
-        void handleRequest(HttpExchange exchange) throws Exception {
-            Map<String, String> body = parseJsonBody(exchange);
-            String startStr = body.get("start");
-            String endStr = body.get("end");
-
-            if (startStr == null || endStr == null) {
-                respondError(exchange, "Provide 'start' and 'end'", 400);
-                return;
-            }
-
-            Address start = parseAddress(startStr);
-            Address end = parseAddress(endStr);
-            if (start == null || end == null) {
-                respondError(exchange, "Invalid address", 400);
-                return;
-            }
-
-            respond(exchange, analyzeRange(start, end));
         }
     }
 }

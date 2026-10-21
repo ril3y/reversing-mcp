@@ -1,6 +1,6 @@
 // Entry point: load a .NET assembly via ICSharpCode.Decompiler, host an
 // HttpListener-based JSON API, and register in ~/.ilspy_mcp/<pid>.json so
-// ilspy/mcp_server.py can discover it.
+// the unified reversing-mcp ILSpy provider can discover it.
 //
 //   dotnet run -- <path-to-assembly.dll> [--port=N]
 //   ./ilspy-mcp-bridge <path-to-assembly.dll>

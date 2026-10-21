@@ -1,362 +1,285 @@
 # reversing-mcp
 
-MCP servers that give Claude Code direct access to IDA Pro, Ghidra, jadx (Android/Java), ILSpy (.NET), Unicorn Engine (emulator), and Frida (dynamic instrumentation). Disassemble, decompile, rename, comment, search, navigate, emulate, and hook running processes without leaving your terminal.
+One MCP server for reverse engineering with IDA Pro, Ghidra, JADX, ILSpy,
+Binary Ninja, radare2, and Frida. It provides stable session IDs, a common
+capability model, persistent database lifecycle, headless operation, and
+guarded provider-native script execution.
 
-## Install
+```text
+Claude Code / Codex
+        |
+        | stdio
+        v
+python -m reversing_mcp
+        |
+        v
+SessionManager + provider registry
+        |
+        +-- IDA adapter --------> IDA plugin or owned idat64 process
+        +-- Ghidra adapter -----> GUI extension or analyzeHeadless
+        +-- JADX adapter -------> owned jadx-core JVM
+        +-- ILSpy adapter ------> owned .NET bridge
+        +-- Binary Ninja -------> Python API
+        +-- radare2 ------------> r2pipe
+        `-- Frida adapter ------> local/USB/remote Frida device
+```
 
-### Fast path — interactive installer (recommended)
+The native bridges remain provider-specific, but clients register only the
+unified `reversing_mcp` server. Provider differences are reported through
+capabilities and operation metadata rather than separate MCP tool sets.
 
-```bash
+## Quick start
+
+Clone the repository and install the common Python dependencies:
+
+```shell
 git clone https://github.com/ril3y/reversing-mcp.git
 cd reversing-mcp
+python -m pip install mcp httpx
+```
+
+Run the installer interactively:
+
+```shell
 python install.py
 ```
 
-Walks you through a colored checkbox menu of which servers to install, picks
-`user` vs. `project` scope, and **runs all the build + deploy + register
-steps for you**.
+Or register the unified server non-interactively without changing any provider
+installation:
 
-By default, the installer **pulls prebuilt bridge artifacts from the latest
-GitHub release** so you don't need a JDK / .NET SDK / Ghidra install just to
-get going:
-
-| Tool   | Default path (no toolchain needed) | Fallback if download fails |
-|--------|-------------------------------------|----------------------------|
-| IDA    | Copies `ida/plugin.py` into your IDA user plugins dir | n/a — no build step |
-| Ghidra | Downloads `ghidra-mcp-bridge.zip` from latest release → `~/.ghidra/.ghidra_<ver>/Extensions/` | `gradle build` against your `GHIDRA_INSTALL_DIR` (needs JDK 21) |
-| jadx   | Downloads `jadx-mcp-bridge.jar` from latest release | `./gradlew shadowJar` (needs JDK 17+) |
-| ILSpy  | Downloads `ilspy-mcp-bridge.zip` and unpacks it | `dotnet publish -c Release` (needs .NET 8 SDK) |
-| Unicorn| `pip install unicorn capstone`     | n/a — pip is the build |
-| Frida  | `pip install frida frida-tools` (for Android/iOS also push `frida-server` to the device — see `frida/README.md`) | n/a — no in-tool bridge |
-
-…then `claude mcp add` for each picked tool. Self-installs its own deps
-(`rich`, `questionary`) on first run, so the *only* prerequisite is a working
-`python` + `git` + `claude` CLI.
-
-Non-interactive / CI usage:
-
-```bash
-python install.py --all --scope user                  # everything available on this branch
-python install.py --tools ida,ghidra --scope user     # just two
-python install.py --tools ida --skip-builds           # skip the bridge build step entirely
-python install.py --tools ida --dry-run               # print what would happen, change nothing
-python install.py --tools ghidra --from-source        # force source build, skip prebuilt
-python install.py --tools ghidra --release-tag v0.5.0 # pin to a specific release
+```shell
+python install.py --register-only --scope user --clients claude,codex
 ```
 
-> Prebuilt artifacts are published by `.github/workflows/release.yml` on every
-> `v*` tag — see the [Releases page](https://github.com/ril3y/reversing-mcp/releases).
-> Source builds remain the source of truth and are always exercised in CI on
-> every PR.
+To build and deploy every provider component available in the checkout:
 
-### Manual install (if you don't want to run the installer)
-
-#### 1. Clone + Python deps
-
-```bash
-git clone https://github.com/ril3y/reversing-mcp.git
-cd reversing-mcp
-pip install mcp httpx
+```shell
+python install.py --all --scope user --clients claude,codex
 ```
 
-#### 2. Register the MCP servers with Claude Code
+For only IDA and Ghidra, install their bridges and register the single unified
+server in both clients with:
 
-Pick the line that matches your shell. **Both lines use the four stable servers
-on `main`** — `unicorn` and `saleae_native` live on WIP branches (see
-[WIP branches](#wip-branches) below) and are not registered by default.
-
-**Linux / macOS / Git Bash** (run from the repo root):
-
-```bash
-REPO=$(pwd)
-for tool in ida ghidra jadx ilspy frida; do
-  claude mcp add -s user "$tool" -- python "$REPO/$tool/mcp_server.py"
-done
+```shell
+python install.py --tools ida,ghidra --scope user --clients claude,codex
 ```
 
-**Windows PowerShell** (run from the repo root):
+This creates one MCP entry named `reversing-mcp`; IDA and Ghidra are providers
+selected through `open_session`, `create_session`, `reopen_session`, or
+`attach_session`. Do not register separate `ida` or `ghidra` MCP servers.
+
+Use `--dry-run` to inspect commands first. Codex CLI registration is
+user-global, so select `--scope user` when `codex` is one of the clients.
+
+The installed command is:
+
+```shell
+python -m reversing_mcp
+```
+
+See [the unified server guide](docs/UNIFIED_SERVER.md) for manual registration,
+script policy, and lifecycle details.
+
+## Unified MCP surface
+
+The server exposes a small lifecycle-oriented API:
+
+| Tool | Purpose |
+|---|---|
+| `list_backends` | List providers, capabilities, and declared operations |
+| `list_sessions` | List sessions owned by the server process |
+| `capabilities` | Inspect one provider or live session |
+| `open_session` | Open a target using a provider's normal lifecycle |
+| `create_session` | Create a persistent database from an artifact |
+| `reopen_session` | Reopen an existing database or project |
+| `attach_session` | Attach to a compatible GUI or provider process |
+| `invoke` | Run a declared, non-script analysis operation |
+| `run_script` | Run a guarded provider-native script in its declared language |
+| `run_python` | Run provider-native Python when policy allows it |
+| `save_session` | Persist the provider database or project |
+| `close_session` | Save and close an owned session |
+
+Common operation names include `target.info`, `analysis.decompile`,
+`analysis.disassemble`, `references.to`, `references.from`,
+`symbols.rename`, `comments.write`, `types.define`, and `types.apply`.
+Each session advertises its exact operation set; unsupported behavior returns a
+structured error.
+
+Mutating operations save by default. A session should still be closed with
+`close_session(save=true)` so the provider can flush and exit normally.
+
+## Provider setup
+
+### IDA Pro
+
+The installer copies `ida/plugin.py` to the IDA user plugin directory. On
+Windows this is normally:
+
+```text
+%APPDATA%\Hex-Rays\IDA Pro\plugins\ida_mcp_plugin.py
+```
+
+The plugin starts its loopback HTTP bridge when a database opens. It marshals
+all IDA API work onto IDA's main thread; the HTTP worker never calls IDAPython
+analysis APIs directly.
+
+For an owned headless database, start the local spawn service:
 
 ```powershell
-$repo = (Get-Location).Path
-foreach ($tool in 'ida','ghidra','jadx','ilspy','frida') {
-  claude mcp add -s user $tool -- python "$repo/$tool/mcp_server.py"
-}
+python ida\spawn_server.py --headless `
+  --ida-path "C:\Program Files\IDA Pro 8.4\idat64.exe"
 ```
 
-> On Windows the launcher is `python` (not `python3`). If `python --version`
-> shows the wrong interpreter, substitute an absolute path like
-> `C:\Python312\python.exe`.
+Then use `create_session` or `reopen_session` with `provider="ida"` and
+`mode="headless"`. Names, comments, types, function edits, and the scratch
+notebook persist in the `.i64`/`.idb`. See [IDA headless
+sessions](ida/HEADLESS.md).
 
-Or — if you'd rather edit your config directly — add this to `~/.claude.json`
-(or `~/.claude/.mcp.json`) under `"mcpServers"`, with `/path/to/reversing-mcp`
-replaced by your absolute clone path:
+Remote exposure is opt-in and unauthenticated. Bind spawn and bridge services
+only to trusted interfaces. Remote IDA bridges refuse Python execution.
 
-```json
-{
-  "ida":    { "command": "python", "args": ["/path/to/reversing-mcp/ida/mcp_server.py"] },
-  "ghidra": { "command": "python", "args": ["/path/to/reversing-mcp/ghidra/mcp_server.py"] },
-  "jadx":   { "command": "python", "args": ["/path/to/reversing-mcp/jadx/mcp_server.py"] },
-  "ilspy":  { "command": "python", "args": ["/path/to/reversing-mcp/ilspy/mcp_server.py"] },
-  "frida":  { "command": "python", "args": ["/path/to/reversing-mcp/frida/mcp_server.py"] }
-}
-```
+### Ghidra
 
-#### 3. Verify
+Set `GHIDRA_INSTALL_DIR`, then let the installer build and deploy the extension:
 
-```bash
-claude mcp list
-```
-
-You should see all four marked `✓ Connected`. If a server isn't connecting,
-launch its `mcp_server.py` manually — any traceback (missing `mcp` or `httpx`
-packages, wrong Python, etc.) will print to stderr.
-
-> The MCP server connecting only means the **stdio glue is alive** — it does
-> *not* mean a bridge is running inside IDA/Ghidra/jadx/ILSpy. Open one of
-> those tools (with the bridge installed per step 4) before you make calls,
-> or each tool will return `"No <Tool> instances found."`.
-
-#### 4. Install the in-tool bridge
-
-You need a bridge running inside each RE tool so the MCP server can talk to it.
-Install only the bridges for the tools you actually use.
-
-#### Ghidra (Extension — recommended)
-
-The extension auto-starts the bridge when you open a program. No manual script launching needed.
-
-**Easiest path — download the prebuilt ZIP** from the latest
-[release](https://github.com/ril3y/reversing-mcp/releases). Drop it in
-`~/.ghidra/.ghidra_<version>/Extensions/` (Windows: `%APPDATA%\ghidra\.ghidra_<version>\Extensions\`).
-
-**Or build from source** (requires JDK 21 + an unpacked Ghidra install):
-
-```bash
-cd ghidra/ghidra-mcp-bridge
-export GHIDRA_INSTALL_DIR=/path/to/ghidra    # Windows: $env:GHIDRA_INSTALL_DIR = "C:\path\to\ghidra"
-./gradlew                                    # Windows: .\gradlew.bat
-```
-
-(The `gradlew` wrapper is vendored — you don't need a system `gradle` install.)
-
-Then in Ghidra: **File > Install Extensions > +**, pick the ZIP from
-`ghidra/ghidra-mcp-bridge/dist/`, restart Ghidra, and open a program.
-`mcp__ghidra__list_instances` should now show it.
-
-#### Ghidra (Script — alternative)
-
-If you prefer not to install an extension, copy `ghidra/bridge.java` to your `ghidra_scripts/` directory and run it from the Script Manager. The script blocks with a dialog — click "No" to stop the server.
-
-#### IDA Pro
-
-Drop `ida/plugin.py` into your IDA user plugins directory and restart IDA — the
-plugin auto-starts when an IDB loads and binds `Ctrl+Shift+M` to toggle it.
-
-**Linux / macOS**:
-```bash
-ln -sf "$(pwd)/ida/plugin.py" ~/.idapro/plugins/ida_mcp_plugin.py
-```
-
-**Windows PowerShell**:
 ```powershell
-$plugins = "$env:APPDATA\Hex-Rays\IDA Pro\plugins"
-New-Item -ItemType Directory -Force $plugins | Out-Null
-Copy-Item ida\plugin.py "$plugins\ida_mcp_plugin.py"
+$env:GHIDRA_INSTALL_DIR = "C:\path\to\ghidra"
+python install.py --tools ghidra --scope user --clients claude
 ```
 
-The Output window will print `[MCP] Server started on http://127.0.0.1:13337`
-when the bridge is up. Verify from a shell with `python ida/mcp_server.py --list`.
+Enable the extension in Ghidra and restart. GUI sessions attach to a program
+owned by the user; remote close is rejected. Headless sessions launch
+`analyzeHeadless`, create or reopen a project program, and save when the owned
+process closes. See [Ghidra headless lifecycle](ghidra/HEADLESS.md).
 
-#### jadx (standalone Java bridge)
+### JADX
 
-Unlike Ghidra/IDA, jadx has no resident GUI to host the bridge — it's a separate JVM process per APK/JAR. Either grab the prebuilt fat JAR from the latest [release](https://github.com/ril3y/reversing-mcp/releases) or build it once:
+JADX runs without a GUI. Build the fat JAR with JDK 17 or newer:
 
-```bash
+```shell
 cd jadx/jadx-mcp-bridge
-./gradlew shadowJar                        # Windows: .\gradlew.bat shadowJar  (JDK 17+ required)
-java -jar build/libs/jadx-mcp-bridge.jar /path/to/app.apk
+gradle shadowJar
 ```
 
-The bridge writes `~/.jadx_mcp/<pid>.json` and the MCP server picks it up. Run multiple bridges for multiple APKs; target one from Claude with `jar="app.apk"`.
+The unified provider starts an owned JVM per APK, AAB, JAR, or DEX. Set
+`JADX_MCP_BRIDGE_JAR` when the artifact is not in the default Gradle output
+directory. JADX sessions are intentionally read-only. See [JADX provider
+notes](jadx/PROVIDER.md).
 
-#### ILSpy (standalone .NET bridge)
+### ILSpy
 
-Same shape — a console process per loaded assembly:
+ILSpy is a read-only, headless managed-code provider. Build its .NET bridge:
 
-```bash
-cd ilspy/IlspyMcpBridge
-dotnet publish -c Release                  # .NET 8 SDK required
-./bin/Release/net8.0/publish/ilspy-mcp-bridge /path/to/lib.dll
+```shell
+dotnet publish ilspy/IlspyMcpBridge/IlspyMcpBridge.csproj -c Release
 ```
 
-The bridge writes `~/.ilspy_mcp/<pid>.json`. Target with `assembly="lib.dll"` when multiple are running.
+`open_session(provider="ilspy", target_path="...dll")` starts and owns one
+bridge process per assembly. It supports assembly/type/method discovery, C#
+decompilation, raw IL, referenced assemblies, and string search. Because the
+analysis is read-only, ILSpy advertises open/attach/close but not fake
+save/create/reopen capabilities.
 
-#### Unicorn emulator (pure Python bridge)
+### Frida
 
-Unicorn is different from the others — there's no separate RE tool to host the bridge inside. The bridge is just a Python script; `pip install` it and run one process per emulation session, picking the CPU mode on argv:
+Install the Python client and, for Android/iOS, run a matching `frida-server`
+on the target:
 
-```bash
-pip install unicorn                                  # capstone is pulled in too if not already
-python unicorn/bridge.py --arch thumb                # picks a free port in 13737-13800
-python unicorn/bridge.py --arch x86_64 --port 13745  # explicit port
+```shell
+python -m pip install frida frida-tools
 ```
 
-The bridge writes `~/.unicorn_mcp/<pid>.json` with `{pid, port, arch}`. Target with `arch="thumb"` when multiple are running. The bridge is deliberately generic — `--arch` is the only required flag; memory map, register state, hooks, and snapshots are all configured at runtime through MCP calls (see `cookbooks/mt7697-bringup.md` for a worked example).
+Frida supports inventory-only sessions, attach, suspended spawn/resume,
+module/import/export inspection, bounded memory reads, JavaScript injection,
+message draining, and RPC exports. JavaScript goes through guarded
+`run_script(language="javascript", ...)`; closing detaches and optionally
+kills only a process spawned by that session. See [Frida provider
+notes](frida/README.md).
 
-Supported archs: `thumb`, `arm`, `arm64`, `x86`, `x86_64`, `mips`, `mipsel`, `mips64`, `riscv32`, `riscv64`.
+### Binary Ninja
 
-### Use it
+Configure the `binaryninja` Python module for the same interpreter registered
+with the MCP client. The adapter imports the SDK lazily, so a missing Binary
+Ninja installation does not prevent other providers from starting. Persistent
+state is stored in `.bndb` files.
 
-Open a binary in Ghidra or IDA, then ask Claude Code to analyze it:
+### radare2
 
-```
-> decompile the function at 0x80001000
-> what does main() do?
-> find all callers of send_packet
-> rename 0x80004500 to parse_header
-```
+Install radare2 and make its executable available on `PATH`, then install the
+Python transport:
 
-## Architecture
-
-```
-Claude Code  ←stdio→  mcp_server.py  ←HTTP→  bridge process
-                           │
-                      common.py (shared discovery)
-```
-
-Each bridge runs an HTTP server and registers itself in `~/.<tool>_mcp/<pid>.json` with `{pid, port, <target>, <target_path>}`. The MCP servers discover running instances automatically. Multiple instances are supported — use the `program`/`idb`/`jar`/`assembly` parameter to target a specific one by substring match.
-
-Bridges come in two shapes:
-- **Resident plugin** (IDA, Ghidra) — runs inside the tool's GUI; auto-starts when a binary is loaded.
-- **Standalone process** (jadx, ILSpy) — a separate JVM/.NET process launched with the target file as an argument. Decouples MCP access from a heavy GUI.
-
-```
-reversing-mcp/
-├── common.py                       Shared instance discovery + HTTP proxy
-├── ghidra/
-│   ├── bridge.java                 GhidraScript bridge (runs inside Ghidra)
-│   ├── GhidraMcpPlugin.java        ProgramPlugin bridge (auto-starts)
-│   ├── ghidra-mcp-bridge/          Ghidra extension (Gradle project)
-│   └── mcp_server.py
-├── ida/
-│   ├── plugin.py                   IDA plugin (runs inside IDA)
-│   └── mcp_server.py
-├── jadx/
-│   ├── jadx-mcp-bridge/            Standalone jadx-core Java app (Gradle)
-│   └── mcp_server.py
-├── ilspy/
-│   ├── IlspyMcpBridge/             Standalone ICSharpCode.Decompiler .NET app
-│   └── mcp_server.py
-├── unicorn/
-│   ├── bridge.py                   Pure-Python in-process Unicorn HTTP bridge
-│   ├── mcp_server.py
-│   └── SMOKE.md                    Live smoke test transcript
-├── cookbooks/                      Worked examples of bridge primitives
-└── tests/                          pytest suite for common.py + MCP servers
+```shell
+python -m pip install r2pipe
 ```
 
-## Available Tools
+The adapter opens targets headlessly and persists state through radare2
+projects. Project names are validated before being passed to radare2.
 
-The IDA and Ghidra servers expose the same binary-level tools:
+## Script execution
 
-| Tool | Description |
-|------|-------------|
-| `list_instances` | List active tool instances and loaded binaries |
-| `idb_info` | Program info (function count, segments, processor, bitness) |
-| `get_function` | Get function by address or name |
-| `disassemble` | Disassemble a function or address range |
-| `decompile` | Decompile to C pseudocode (Ghidra decompiler / Hex-Rays) |
-| `xrefs_to` / `xrefs_from` | Cross-references |
-| `get_callers` / `get_callees` | Call graph |
-| `search_functions` / `search_strings` | Substring search |
-| `get_segments` / `get_bytes` | Memory layout / raw bytes |
-| `rename` / `add_comment` | Mutate the database |
-| `create_function` / `delete_function` | Function management |
+Provider-native scripts are disabled by default. Enable them only for trusted
+local targets:
 
-IDA additionally has `make_code` and `find_micromips_prologues`.
-
-The jadx and ILSpy servers expose a higher-level managed-language surface:
-
-| jadx | ILSpy | Description |
-|------|-------|-------------|
-| `info` | `info` | Loaded archive/assembly info |
-| `list_classes` | `list_types` | Enumerate (with optional prefix) |
-| `search_classes` | `search_types` | Substring search |
-| `get_class` | — | Class metadata + method list |
-| `decompile_class` | `decompile_type` | Full Java / C# source |
-| `list_methods` | `list_methods` | Methods of a class/type |
-| `decompile_method` | `decompile_method` | Single-method source |
-| — | `get_il` | Raw IL for a method |
-| `search_strings` | `search_strings` | Source-level string grep with line/snippet |
-| `xrefs_to` | — | Usages of a class or method |
-| — | `list_assemblies` | Referenced assemblies |
-
-The Unicorn server exposes a generic emulator surface — there's no "program loaded", just an arch and whatever memory map you build at runtime:
-
-| Tool | Description |
-|------|-------------|
-| `info` | Bridge state: arch, mapped regions, PC, hook/snapshot counts |
-| `list_regions` / `map_region` / `unmap_region` | Memory map management |
-| `load_bytes` / `load_file` | Write hex blob or host file into a mapped region |
-| `read_mem` / `write_mem` | Raw memory I/O (hex strings) |
-| `read_reg` / `write_reg` | CPU register access (arch-specific names: `pc`, `r0`, `rax`, `x0`, ...) |
-| `disasm` | Disassemble bytes at an address (uses capstone) |
-| `step` / `run_until` | Execute N instructions / run until PC / instruction budget / timeout |
-| `add_hook` / `remove_hook` / `list_hooks` | Install `mem_read+stub`, `mem_read+trace`, `mem_write+trace`, `code+stub`, `code+break`, `block+trace` hooks |
-| `snapshot` / `restore` / `list_snapshots` | Capture and roll back register state + region contents |
-
-## Multi-Instance Support
-
-If you have multiple binaries open (e.g., two Ghidra windows), pass the program name to target a specific one:
-
-```
-> decompile main in firmware.bin
-> list all ghidra instances
+```shell
+python install.py --register-only --scope user --clients claude,codex \
+  --allow-scripts --script-providers ida,ghidra,frida,binary_ninja,radare2
 ```
 
-The MCP server resolves instances by substring match on the program/IDB name.
+This sets `REVERSING_MCP_ALLOW_SCRIPTS=1` and an optional
+`REVERSING_MCP_SCRIPT_PROVIDERS` allowlist. Generic `invoke` cannot bypass the
+guard; scripts must use `run_python` or `run_script`, and the live session must
+advertise the corresponding capability such as `script.python` or
+`script.javascript`.
 
-## Troubleshooting
+Scripts run with the provider process's privileges and may modify its database
+or host. Arbitrary in-process Python cannot always be interrupted safely. A
+client timeout does not prove that the provider stopped executing the script.
 
-**"No Ghidra/IDA instances found"** — The bridge isn't running. For Ghidra, make sure the extension is installed and a program is open. For IDA, check the plugin loaded (Output window should show the MCP port).
+## Development
 
-**Check active instances manually:**
+The shared Python package is organized as follows:
 
-```bash
-python3 ghidra/mcp_server.py  --list
-python3 ida/mcp_server.py     --list
-python3 jadx/mcp_server.py    --list
-python3 ilspy/mcp_server.py   --list
-python3 unicorn/mcp_server.py --list
+```text
+reversing_mcp/
+|-- models.py              Wire models, capabilities, and common operations
+|-- backends.py            AnalysisBackend and AnalysisSession interfaces
+|-- registry.py            Provider registration
+|-- manager.py             Lifecycle, policy, persistence, and dispatch
+|-- server.py              Unified FastMCP surface
+`-- providers/
+    |-- local_bridges.py   IDA, Ghidra, and JADX adapters
+    |-- ilspy.py           ILSpy read-only bridge adapter
+    |-- frida.py           Frida dynamic instrumentation adapter
+    |-- binary_ninja.py    Binary Ninja adapter
+    `-- radare2.py         radare2 adapter
 ```
 
-**Registration files are stale** — If a bridge crashed, stale files in `~/.<tool>_mcp/` get auto-cleaned on next discovery (dead PIDs are pruned, and refused-connection registrations are unlinked).
+Provider bridges live in their own directories and communicate over loopback
+HTTP where an in-process SDK is not practical. Registration files under
+`~/.<provider>_mcp/` identify live bridge processes.
 
-## Running the tests
+Run the checks with:
 
-```bash
-pip install pytest
-python -m pytest tests/
+```shell
+python -m ruff format --check .
+python -m ruff check .
+python -m pytest -q
 ```
 
-The suite covers `common.py` discovery/proxy logic plus the jadx, ILSpy, and Unicorn MCP servers against an in-process HTTP bridge. No IDA / Ghidra / jadx / ILSpy / Unicorn installation is needed to run the tests (the bridge layer is mocked).
+To add a provider, implement `AnalysisBackend` and `AnalysisSession`, declare
+capabilities and `OperationSpec` entries, add it to
+`reversing_mcp.providers.builtin_backends()`, and add lifecycle round-trip
+tests. Persistent providers should prove that a rename/comment/type mutation
+survives save, close, and reopen without modifying the input artifact.
 
-## Adding a New Tool
+## Safety notes
 
-1. Create `toolname/` directory
-2. Write the in-tool bridge (starts HTTP server, registers in `~/.toolname_mcp/`)
-3. Write `mcp_server.py` using `common.py` for discovery
-4. `claude mcp add toolname -- python3 /path/to/reversing-mcp/toolname/mcp_server.py`
+- Bridges bind to loopback by default and do not provide authentication.
+- IDA mutations are blocked while its debugger is running or paused because
+  changing database structures in that state can crash IDA.
+- Ghidra headless changes are durable only after its outer transaction closes.
+- Static decompilation is evidence about program structure, not observed
+  runtime behavior.
+- Keep provider SDKs and analysis engines pinned in reproducible automation.
 
-## WIP branches
-
-The references above to **Unicorn** (`unicorn/`) and **saleae_native** (`saleae_native/`)
-describe code that lives on branches and has not yet merged to `main`:
-
-| Branch | Status | Contents |
-|--------|--------|----------|
-| `unicorn` | Functional, pending stabilization | `unicorn/` bridge + server, `tests/test_unicorn_server.py`, `cookbooks/mt7697-bringup.md` |
-| `saleae` | RE-in-progress skeleton | `saleae_native/` (driver/bridge/server stubs + IDA-driven RE notes) |
-
-Check those out separately (`git checkout unicorn`, `git checkout saleae`) to use them
-while they bake.
+Use these tools only on software and devices you are authorized to analyze.
