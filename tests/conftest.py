@@ -40,7 +40,9 @@ class FakeBridge:
         self._server: HTTPServer | None = None
         self._thread: threading.Thread | None = None
 
-    def route(self, path: str, handler: Callable[[str, dict], tuple[int, dict]]) -> None:
+    def route(
+        self, path: str, handler: Callable[[str, dict], tuple[int, dict]]
+    ) -> None:
         self.routes[path] = handler
 
     @property
@@ -90,9 +92,7 @@ class FakeBridge:
                 self._serve("POST")
 
         self._server = HTTPServer(("127.0.0.1", 0), Handler)
-        self._thread = threading.Thread(
-            target=self._server.serve_forever, daemon=True
-        )
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -122,8 +122,14 @@ def reg_dir(tmp_path) -> str:
     return str(d)
 
 
-def write_registration(reg_dir: str, *, port: int, name_key: str = "name",
-                       name: str = "target", pid: int | None = None) -> int:
+def write_registration(
+    reg_dir: str,
+    *,
+    port: int,
+    name_key: str = "name",
+    name: str = "target",
+    pid: int | None = None,
+) -> int:
     """Write a registration JSON file pointing at ``port``. Returns the PID used."""
     if pid is None:
         pid = os.getpid()  # always alive — discovery treats it as live
@@ -135,11 +141,17 @@ def write_registration(reg_dir: str, *, port: int, name_key: str = "name",
 
 
 @contextmanager
-def bridge_registered(fake_bridge: FakeBridge, reg_dir: str,
-                      *, name_key: str = "name", name: str = "target") -> Iterator[int]:
+def bridge_registered(
+    fake_bridge: FakeBridge,
+    reg_dir: str,
+    *,
+    name_key: str = "name",
+    name: str = "target",
+) -> Iterator[int]:
     """Write+remove a registration that points at the live fake_bridge."""
-    pid = write_registration(reg_dir, port=fake_bridge.port,
-                             name_key=name_key, name=name)
+    pid = write_registration(
+        reg_dir, port=fake_bridge.port, name_key=name_key, name=name
+    )
     try:
         yield pid
     finally:

@@ -30,16 +30,19 @@ import sys
 try:
     import httpx
 except ImportError:
-    print("ERROR: httpx not installed. `pip install httpx` and retry.",
-          file=sys.stderr)
+    print("ERROR: httpx not installed. `pip install httpx` and retry.", file=sys.stderr)
     sys.exit(2)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=13437,
-                    help="Plugin port (default: 13437, the plugin's BASE_PORT)")
+    ap.add_argument(
+        "--port",
+        type=int,
+        default=13437,
+        help="Plugin port (default: 13437, the plugin's BASE_PORT)",
+    )
     ap.add_argument("--timeout", type=int, default=30)
     args = ap.parse_args()
 
@@ -50,8 +53,10 @@ def main() -> int:
     try:
         r = httpx.get(f"{base}/ping", timeout=5)
     except httpx.ConnectError as e:
-        print(f"FAIL: cannot reach {base}/ping — is Ghidra running with the "
-              f"MCP plugin enabled and a program open? ({e})")
+        print(
+            f"FAIL: cannot reach {base}/ping — is Ghidra running with the "
+            f"MCP plugin enabled and a program open? ({e})"
+        )
         return 2
     print(f"  /ping  -> {r.status_code} {r.text[:120]}")
     if r.status_code != 200:
@@ -75,34 +80,40 @@ def main() -> int:
         print("FAIL: at least one exec_script returned success=false")
         ok = False
     if j1.get("stdout") == j2.get("stdout"):
-        print("FAIL: both exec_script calls returned IDENTICAL stdout "
-              "(parseJsonBody body-cache bug is still live)")
+        print(
+            "FAIL: both exec_script calls returned IDENTICAL stdout "
+            "(parseJsonBody body-cache bug is still live)"
+        )
         ok = False
     else:
-        assert "AAA" in (j1.get("stdout") or ""), \
-            f"call 1 missing AAA token: {j1!r}"
-        assert "BBB" in (j2.get("stdout") or ""), \
-            f"call 2 missing BBB token: {j2!r}"
+        assert "AAA" in (j1.get("stdout") or ""), f"call 1 missing AAA token: {j1!r}"
+        assert "BBB" in (j2.get("stdout") or ""), f"call 2 missing BBB token: {j2!r}"
         print("  PASS: distinct stdout for distinct code")
 
     # Same shape for search_strings — needs DefinedData in the loaded program
     # so we just check that two patterns produce different result sets (which
     # would be the FIRST call's set on the buggy plugin).
-    rs1 = httpx.post(f"{base}/search_strings", json={"pattern": "the"},
-                     timeout=args.timeout).json()
-    rs2 = httpx.post(f"{base}/search_strings", json={"pattern": "qqqqzzzz"},
-                     timeout=args.timeout).json()
+    rs1 = httpx.post(
+        f"{base}/search_strings", json={"pattern": "the"}, timeout=args.timeout
+    ).json()
+    rs2 = httpx.post(
+        f"{base}/search_strings", json={"pattern": "qqqqzzzz"}, timeout=args.timeout
+    ).json()
     print(f"  /search_strings 'the'      -> {len(rs1.get('strings', []))} hits")
     print(f"  /search_strings 'qqqqzzzz' -> {len(rs2.get('strings', []))} hits")
     if rs1 == rs2 and rs1.get("strings"):
-        print("FAIL: search_strings returned identical sets for distinct "
-              "patterns (body-cache bug live for search_strings)")
+        print(
+            "FAIL: search_strings returned identical sets for distinct "
+            "patterns (body-cache bug live for search_strings)"
+        )
         ok = False
     elif rs1 != rs2:
         print("  PASS: distinct search_strings results for distinct patterns")
     else:
-        print("  SKIP: both patterns returned empty — inconclusive "
-              "(program may have no defined strings)")
+        print(
+            "  SKIP: both patterns returned empty — inconclusive "
+            "(program may have no defined strings)"
+        )
 
     return 0 if ok else 1
 

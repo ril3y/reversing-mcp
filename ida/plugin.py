@@ -20,7 +20,6 @@ import traceback
 from datetime import datetime, timezone
 from html import escape as html_escape
 
-import ida_auto
 import ida_bytes
 import ida_dbg
 import ida_funcs
@@ -29,8 +28,8 @@ import ida_ida
 import ida_idaapi
 import ida_idd
 import ida_kernwin
+import ida_loader
 import ida_netnode
-import ida_lines
 import ida_name
 import ida_nalt
 import ida_segment
@@ -41,16 +40,24 @@ import idc
 
 # IDA 9.2 removed ida_xref.get_xref_type_name -- map manually
 _XREF_TYPE_NAMES = {
-    0: "Data_Unknown", 1: "Data_Offset", 2: "Data_Write", 3: "Data_Read",
-    4: "Data_Text", 5: "Data_Informational",
-    16: "Code_Far_Call", 17: "Code_Near_Call",
-    18: "Code_Far_Jump", 19: "Code_Near_Jump",
-    20: "Code_User", 21: "Code_Ordinary_Flow",
+    0: "Data_Unknown",
+    1: "Data_Offset",
+    2: "Data_Write",
+    3: "Data_Read",
+    4: "Data_Text",
+    5: "Data_Informational",
+    16: "Code_Far_Call",
+    17: "Code_Near_Call",
+    18: "Code_Far_Jump",
+    19: "Code_Near_Jump",
+    20: "Code_User",
+    21: "Code_Ordinary_Flow",
 }
 
 
 def _xref_type_name(t):
     return _XREF_TYPE_NAMES.get(t, f"type_{t}")
+
 
 REGISTRATION_DIR = os.path.expanduser("~/.ida_mcp")
 BASE_PORT = 13337
@@ -72,19 +79,59 @@ def _detect_lan_ip():
         return "127.0.0.1"
 
 
-# Interface to bind on. Default 0.0.0.0 so a remote MCP bridge can reach this
-# instance over the LAN (not just localhost). Override with IDA_MCP_BIND=127.0.0.1.
-BIND_HOST = os.environ.get("IDA_MCP_BIND", "0.0.0.0").strip() or "0.0.0.0"
+# Local-only by default. Remote access is an explicit operator decision because
+# this bridge can mutate databases, control a debugger, and run IDAPython.
+BIND_HOST = os.environ.get("IDA_MCP_BIND", "127.0.0.1").strip() or "127.0.0.1"
 # The real reachable address to advertise (registration file + startup banner).
-ADVERTISE_HOST = "127.0.0.1" if BIND_HOST in ("127.0.0.1", "localhost") else _detect_lan_ip()
+ADVERTISE_HOST = (
+    "127.0.0.1" if BIND_HOST in ("127.0.0.1", "localhost", "::1") else _detect_lan_ip()
+)
+
+PROTOCOL_VERSION = "1.0"
+_BASE_CAPABILITIES = (
+    "lifecycle.create",
+    "lifecycle.open",
+    "lifecycle.reopen",
+    "lifecycle.attach",
+    "lifecycle.save",
+    "lifecycle.close",
+    "analysis.disassemble",
+    "analysis.decompile",
+    "analysis.functions",
+    "analysis.xrefs",
+    "analysis.search",
+    "analysis.bytes",
+    "analysis.segments",
+    "analysis.types",
+    "symbols.rename",
+    "comments.set",
+    "comments.write",
+    "functions.create",
+    "functions.delete",
+    "types.define",
+    "types.apply",
+)
 
 # Headless mode: idat / idat64 (text UI) rather than ida / ida64 (GUI).
-# register_timer does not fire without the Qt event loop, so in headless
-# mode we route every request through execute_sync instead.
+# register_timer does not fire without the Qt event loop. The headless runner
+# therefore calls drain_headless_requests() from IDA's main thread.
 try:
     _HEADLESS = not ida_kernwin.is_idaq()
 except Exception:
     _HEADLESS = False
+
+_MODE = os.environ.get("IDA_MCP_MODE", "headless" if _HEADLESS else "gui")
+_SOURCE_PATH = os.environ.get("IDA_MCP_SOURCE_PATH", "")
+_DATABASE_PATH = os.environ.get("IDA_MCP_DATABASE_PATH", "")
+_AUTOSAVE_POLICY = os.environ.get(
+    "IDA_MCP_AUTOSAVE", "after_mutation" if _HEADLESS else "manual"
+)
+_ALLOW_PYTHON = os.environ.get("IDA_MCP_ALLOW_PYTHON", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 _request_queue = []
 _request_lock = threading.Lock()
@@ -94,42 +141,16 @@ def _run_on_main_thread(func, *args, **kwargs):
     """Execute a function on IDA's main thread and return its result.
 
     GUI mode: queue + UI timer (register_timer fires every 100 ms).
-    Headless mode: execute_sync (works in idat without the Qt event loop).
+    Headless mode: the runner drains the same queue from IDA's main thread.
 
     In GUI mode, if the request stays queued for >5 s a warning is printed —
     common causes: modal dialog, slow Hex-Rays call, viewer macro decompile.
     """
     label = kwargs.pop("_mcp_label", None) or getattr(func, "__name__", repr(func))
 
-    if _HEADLESS:
-        # execute_sync blocks the calling (background) thread until the
-        # function has run on the main thread — exactly what we need.
-        result = [None]
-        error  = [None]
-
-        def _thunk():
-            prev = 0
-            try:
-                prev = idc.batch(1)
-                result[0] = func(*args, **kwargs)
-            except Exception as e:
-                error[0] = e
-            finally:
-                try:
-                    idc.batch(prev)
-                except Exception:
-                    pass
-            return 0  # execute_sync expects an int
-
-        ida_kernwin.execute_sync(_thunk, ida_kernwin.MFF_FAST)
-        if error[0] is not None:
-            raise error[0]
-        return result[0]
-
-    # GUI mode — original queue + timer path
     result = [None]
-    error  = [None]
-    done   = threading.Event()
+    error = [None]
+    done = threading.Event()
 
     item = (func, args, kwargs, result, error, done)
     with _request_lock:
@@ -147,6 +168,35 @@ def _run_on_main_thread(func, *args, **kwargs):
     return result[0]
 
 
+def _drain_request_queue():
+    """Run queued HTTP work on the caller's IDA main thread."""
+    with _request_lock:
+        batch = list(_request_queue)
+        _request_queue.clear()
+
+    for func, args, kwargs, result, error, done in batch:
+        prev_batch = 0
+        try:
+            prev_batch = idc.batch(1)
+            result[0] = func(*args, **kwargs)
+        except Exception as exc:
+            error[0] = exc
+        finally:
+            try:
+                idc.batch(prev_batch)
+            except Exception:
+                pass
+            done.set()
+    return len(batch)
+
+
+def drain_headless_requests():
+    """Pump pending bridge calls; called only by the headless runner."""
+    if not _HEADLESS:
+        return 0
+    return _drain_request_queue()
+
+
 class _MainThreadTimer(object):
     """UI timer that drains the request queue on IDA's main thread."""
 
@@ -157,10 +207,6 @@ class _MainThreadTimer(object):
             print("[MCP] WARNING: failed to register UI timer")
 
     def _tick(self):
-        with _request_lock:
-            batch = list(_request_queue)
-            _request_queue.clear()
-
         # Wrap every handler in idc.batch(1) so IDA suppresses modal dialogs
         # for the duration of the call. Without this, a stray "type already
         # exists, overwrite?" / "save Y/N?" popup blocks IDA's main thread,
@@ -169,19 +215,7 @@ class _MainThreadTimer(object):
         # the default action silently. Per-request scope: we restore the
         # previous batch mode after each call so the user's interactive UI
         # is unaffected.
-        for func, args, kwargs, result, error, done in batch:
-            prev_batch = 0
-            try:
-                prev_batch = idc.batch(1)
-                result[0] = func(*args, **kwargs)
-            except Exception as e:
-                error[0] = e
-            finally:
-                try:
-                    idc.batch(prev_batch)
-                except Exception:
-                    pass
-                done.set()
+        _drain_request_queue()
 
         return self._interval  # return interval to keep timer alive
 
@@ -215,9 +249,61 @@ def _idb_name():
     return os.path.basename(path) if path else "unknown"
 
 
+def _database_path():
+    """Return the current IDA database path across supported IDA versions."""
+    try:
+        current = ida_loader.get_path(ida_loader.PATH_TYPE_IDB) or ""
+        if current:
+            return current
+    except (AttributeError, TypeError):
+        try:
+            current = idc.get_idb_path() or ""
+            if current:
+                return current
+        except AttributeError:
+            pass
+    return os.path.abspath(_DATABASE_PATH) if _DATABASE_PATH else ""
+
+
+def _source_path():
+    return os.path.abspath(_SOURCE_PATH) if _SOURCE_PATH else _idb_path()
+
+
+def get_capabilities():
+    capabilities = list(_BASE_CAPABILITIES)
+    if _ALLOW_PYTHON and BIND_HOST in {"127.0.0.1", "localhost", "::1"}:
+        capabilities.append("script.python")
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "provider": "ida",
+        "mode": _MODE,
+        "source_path": _source_path(),
+        "database_path": _database_path(),
+        "autosave_policy": _AUTOSAVE_POLICY,
+        "capabilities": capabilities,
+    }
+
+
+def save_database(path=""):
+    """Persist the current database, optionally selecting a new IDB path."""
+    database_path = os.path.abspath(path) if path else _database_path()
+    if not database_path:
+        return {"error": "IDA did not report a database path"}
+    os.makedirs(os.path.dirname(database_path) or ".", exist_ok=True)
+    try:
+        result = ida_loader.save_database(database_path, 0)
+    except TypeError:
+        # Some older IDAPython releases expose only the one-argument form.
+        result = ida_loader.save_database(database_path)
+    if result is False:
+        return {"error": f"IDA failed to save database: {database_path}"}
+    return {"success": True, "database_path": database_path}
+
+
 # ---------------------------------------------------------------------------
 # IDA query functions
 # ---------------------------------------------------------------------------
+
 
 def get_function_at(addr):
     """Get function info at an address."""
@@ -261,11 +347,13 @@ def disassemble_function(addr):
         size = idc.get_item_size(ea)
         raw = ida_bytes.get_bytes(ea, size)
         hex_bytes = raw.hex() if raw else ""
-        lines.append({
-            "address": f"0x{ea:08X}",
-            "disasm": disasm,
-            "bytes": hex_bytes,
-        })
+        lines.append(
+            {
+                "address": f"0x{ea:08X}",
+                "disasm": disasm,
+                "bytes": hex_bytes,
+            }
+        )
         ea = idc.next_head(ea, func.end_ea + 0x100)
         if ea == idc.BADADDR:
             break
@@ -288,11 +376,13 @@ def disassemble_range(start, end):
         size = idc.get_item_size(ea)
         raw = ida_bytes.get_bytes(ea, size)
         hex_bytes = raw.hex() if raw else ""
-        lines.append({
-            "address": f"0x{ea:08X}",
-            "disasm": disasm,
-            "bytes": hex_bytes,
-        })
+        lines.append(
+            {
+                "address": f"0x{ea:08X}",
+                "disasm": disasm,
+                "bytes": hex_bytes,
+            }
+        )
         ea = idc.next_head(ea, end + 0x100)
         if ea == idc.BADADDR:
             break
@@ -307,12 +397,14 @@ def get_xrefs_to(addr):
         func_name = ""
         if func:
             func_name = ida_name.get_name(func.start_ea) or f"sub_{func.start_ea:X}"
-        refs.append({
-            "from": f"0x{xref.frm:08X}",
-            "from_func": func_name,
-            "type": xref.type,
-            "type_name": _xref_type_name(xref.type),
-        })
+        refs.append(
+            {
+                "from": f"0x{xref.frm:08X}",
+                "from_func": func_name,
+                "type": xref.type,
+                "type_name": _xref_type_name(xref.type),
+            }
+        )
     return refs
 
 
@@ -321,12 +413,14 @@ def get_xrefs_from(addr):
     refs = []
     for xref in idautils.XrefsFrom(addr, 0):
         name = ida_name.get_name(xref.to) or ""
-        refs.append({
-            "to": f"0x{xref.to:08X}",
-            "name": name,
-            "type": xref.type,
-            "type_name": _xref_type_name(xref.type),
-        })
+        refs.append(
+            {
+                "to": f"0x{xref.to:08X}",
+                "name": name,
+                "type": xref.type,
+                "type_name": _xref_type_name(xref.type),
+            }
+        )
     return refs
 
 
@@ -339,11 +433,18 @@ def get_callees(func_addr):
     ea = func.start_ea
     while ea < func.end_ea:
         for xref in idautils.XrefsFrom(ea, 0):
-            if xref.type in (ida_xref.fl_CN, ida_xref.fl_CF,
-                             ida_xref.fl_JN, ida_xref.fl_JF):
+            if xref.type in (
+                ida_xref.fl_CN,
+                ida_xref.fl_CF,
+                ida_xref.fl_JN,
+                ida_xref.fl_JF,
+            ):
                 target_func = ida_funcs.get_func(xref.to)
                 if target_func and target_func.start_ea != func.start_ea:
-                    name = ida_name.get_name(target_func.start_ea) or f"sub_{target_func.start_ea:X}"
+                    name = (
+                        ida_name.get_name(target_func.start_ea)
+                        or f"sub_{target_func.start_ea:X}"
+                    )
                     callees.add((target_func.start_ea, name))
         ea = idc.next_head(ea, func.end_ea + 1)
         if ea == idc.BADADDR:
@@ -355,14 +456,23 @@ def get_callers(func_addr):
     """Get all functions that call a function."""
     callers = set()
     for xref in idautils.XrefsTo(func_addr, 0):
-        if xref.type in (ida_xref.fl_CN, ida_xref.fl_CF,
-                         ida_xref.fl_JN, ida_xref.fl_JF):
+        if xref.type in (
+            ida_xref.fl_CN,
+            ida_xref.fl_CF,
+            ida_xref.fl_JN,
+            ida_xref.fl_JF,
+        ):
             caller_func = ida_funcs.get_func(xref.frm)
             if caller_func:
-                name = ida_name.get_name(caller_func.start_ea) or f"sub_{caller_func.start_ea:X}"
+                name = (
+                    ida_name.get_name(caller_func.start_ea)
+                    or f"sub_{caller_func.start_ea:X}"
+                )
                 callers.add((caller_func.start_ea, name, xref.frm))
-    return [{"address": f"0x{a:08X}", "name": n, "call_site": f"0x{cs:08X}"}
-            for a, n, cs in sorted(callers)]
+    return [
+        {"address": f"0x{a:08X}", "name": n, "call_site": f"0x{cs:08X}"}
+        for a, n, cs in sorted(callers)
+    ]
 
 
 def search_functions(pattern):
@@ -373,11 +483,13 @@ def search_functions(pattern):
         name = ida_name.get_name(func_ea) or ""
         if pattern_lower in name.lower():
             func = ida_funcs.get_func(func_ea)
-            results.append({
-                "address": f"0x{func_ea:08X}",
-                "name": name,
-                "size": func.size() if func else 0,
-            })
+            results.append(
+                {
+                    "address": f"0x{func_ea:08X}",
+                    "name": name,
+                    "size": func.size() if func else 0,
+                }
+            )
             if len(results) >= 100:
                 break
     return results
@@ -391,11 +503,13 @@ def search_strings(pattern):
     for s in sc:
         val = str(s)
         if pattern_lower in val.lower():
-            results.append({
-                "address": f"0x{s.ea:08X}",
-                "value": val,
-                "length": s.length,
-            })
+            results.append(
+                {
+                    "address": f"0x{s.ea:08X}",
+                    "value": val,
+                    "length": s.length,
+                }
+            )
             if len(results) >= 100:
                 break
     return results
@@ -408,16 +522,21 @@ def get_segments():
         seg = ida_segment.getseg(seg_ea)
         name = ida_segment.get_segm_name(seg)
         perms = ""
-        if seg.perm & 4: perms += "R"
-        if seg.perm & 2: perms += "W"
-        if seg.perm & 1: perms += "X"
-        segs.append({
-            "name": name,
-            "start": f"0x{seg.start_ea:08X}",
-            "end": f"0x{seg.end_ea:08X}",
-            "size": seg.end_ea - seg.start_ea,
-            "perms": perms,
-        })
+        if seg.perm & 4:
+            perms += "R"
+        if seg.perm & 2:
+            perms += "W"
+        if seg.perm & 1:
+            perms += "X"
+        segs.append(
+            {
+                "name": name,
+                "start": f"0x{seg.start_ea:08X}",
+                "end": f"0x{seg.end_ea:08X}",
+                "size": seg.end_ea - seg.start_ea,
+                "perms": perms,
+            }
+        )
     return segs
 
 
@@ -447,23 +566,32 @@ def decompile_function(addr):
 
 def execute_python(code):
     """Execute arbitrary Python in IDA's main thread context and return result."""
-    import io, contextlib
+    import contextlib
+    import io
+
     stdout_buf = io.StringIO()
-    result_ns = {}
+    stderr_buf = io.StringIO()
+    result_ns = {"__name__": "__ida_mcp_script__"}
     try:
-        with contextlib.redirect_stdout(stdout_buf):
+        with (
+            contextlib.redirect_stdout(stdout_buf),
+            contextlib.redirect_stderr(stderr_buf),
+        ):
             exec(compile(code, "<mcp_exec>", "exec"), result_ns)
         return {
             "output": stdout_buf.getvalue(),
+            "stderr": stderr_buf.getvalue(),
             "result": result_ns.get("_result"),
             "success": True,
         }
     except Exception as e:
         import traceback as tb
+
         return {
             "error": f"{type(e).__name__}: {e}",
             "traceback": tb.format_exc(),
             "output": stdout_buf.getvalue(),
+            "stderr": stderr_buf.getvalue(),
             "success": False,
         }
 
@@ -521,8 +649,11 @@ def create_function_at(addr, end=None):
             "size": size,
         }
     _mcp_log(f"CREATE FUNC 0x{addr:08X}: FAILED (may need make_code first)")
-    return {"success": False, "address": f"0x{addr:08X}",
-            "error": "add_func failed (may need make_code first)"}
+    return {
+        "success": False,
+        "address": f"0x{addr:08X}",
+        "error": "add_func failed (may need make_code first)",
+    }
 
 
 def make_code_at(addr, size=0):
@@ -541,13 +672,14 @@ def make_code_at(addr, size=0):
                 ea += length
                 count += 1
         _mcp_log(f"MAKE CODE 0x{addr:08X}: {count} instructions created", addr)
-        return {"success": True, "address": f"0x{addr:08X}",
-                "instructions": count}
+        return {"success": True, "address": f"0x{addr:08X}", "instructions": count}
     else:
         length = idc.create_insn(addr)
-        _mcp_log(f"MAKE CODE 0x{addr:08X}: {'OK' if length else 'FAILED'} ({length} bytes)", addr if length else None)
-        return {"success": length > 0, "address": f"0x{addr:08X}",
-                "length": length}
+        _mcp_log(
+            f"MAKE CODE 0x{addr:08X}: {'OK' if length else 'FAILED'} ({length} bytes)",
+            addr if length else None,
+        )
+        return {"success": length > 0, "address": f"0x{addr:08X}", "length": length}
 
 
 def delete_function_at(addr):
@@ -591,7 +723,6 @@ def find_micromips_prologues():
                 continue
 
             # Read 2 bytes
-            b0 = ida_bytes.get_byte(ea)
             b1 = ida_bytes.get_byte(ea + 1)
 
             # microMIPS save16 encoding: first byte has specific patterns
@@ -616,10 +747,14 @@ def find_micromips_prologues():
                 # Verify this isn't already inside a function
                 func = ida_funcs.get_func(ea)
                 if not func:
-                    results.append({
-                        "address": f"0x{ea:08X}",
-                        "bytes": ida_bytes.get_bytes(ea, 8).hex() if ida_bytes.get_bytes(ea, 8) else "",
-                    })
+                    results.append(
+                        {
+                            "address": f"0x{ea:08X}",
+                            "bytes": ida_bytes.get_bytes(ea, 8).hex()
+                            if ida_bytes.get_bytes(ea, 8)
+                            else "",
+                        }
+                    )
 
             ea += 2
 
@@ -638,14 +773,19 @@ def get_idb_info():
         "path": _idb_path(),
         "functions": func_count,
         "segments": seg_count,
-        "processor": ida_ida.inf_get_procname() if hasattr(ida_ida, 'inf_get_procname') else "unknown",
-        "bits": 64 if (ida_ida.inf_is_64bit() if hasattr(ida_ida, 'inf_is_64bit') else False) else 32,
+        "processor": ida_ida.inf_get_procname()
+        if hasattr(ida_ida, "inf_get_procname")
+        else "unknown",
+        "bits": 64
+        if (ida_ida.inf_is_64bit() if hasattr(ida_ida, "inf_is_64bit") else False)
+        else 32,
     }
 
 
 # ---------------------------------------------------------------------------
 # Types / structs / function prototypes
 # ---------------------------------------------------------------------------
+
 
 def define_type(decl):
     """Parse one or more C declarations into the IDB type library.
@@ -661,8 +801,11 @@ def define_type(decl):
     errors = ida_typeinf.parse_decls(None, decl, None, flags)
     if errors:
         _mcp_log(f"DEFINE TYPE: {errors} parse error(s)")
-        return {"success": False, "parse_errors": errors,
-                "error": f"{errors} parsing error(s); check IDA Output window"}
+        return {
+            "success": False,
+            "parse_errors": errors,
+            "error": f"{errors} parsing error(s); check IDA Output window",
+        }
     _mcp_log(f"DEFINE TYPE: parsed ({len(decl)} bytes)")
     return {"success": True, "size": len(decl)}
 
@@ -677,10 +820,10 @@ def apply_type_at(addr, type_decl):
     """
     decl = type_decl.strip()
     # If user passed a bare type name, wrap into a variable decl.
-    if ';' not in decl and '(' not in decl:
+    if ";" not in decl and "(" not in decl:
         decl = f"{decl} x;"
-    elif not decl.endswith(';'):
-        decl += ';'
+    elif not decl.endswith(";"):
+        decl += ";"
 
     ok = idc.SetType(addr, decl)
     if ok:
@@ -693,8 +836,8 @@ def apply_type_at(addr, type_decl):
 def set_function_prototype_at(addr, proto):
     """Set a function's prototype (calling convention + return + args)."""
     decl = proto.strip()
-    if not decl.endswith(';'):
-        decl += ';'
+    if not decl.endswith(";"):
+        decl += ";"
     ok = idc.SetType(addr, decl)
     if ok:
         _mcp_log(f"SET PROTO 0x{addr:08X}: {proto}", addr)
@@ -707,12 +850,16 @@ def set_function_prototype_at(addr, proto):
 # Memory segments
 # ---------------------------------------------------------------------------
 
+
 def _perms_string_to_bits(s):
     """Map 'rwx' subset to IDA's segment.perm bitmask. R=4, W=2, X=1."""
     p = 0
-    if 'r' in s.lower(): p |= 4
-    if 'w' in s.lower(): p |= 2
-    if 'x' in s.lower(): p |= 1
+    if "r" in s.lower():
+        p |= 4
+    if "w" in s.lower():
+        p |= 2
+    if "x" in s.lower():
+        p |= 1
     return p
 
 
@@ -725,12 +872,13 @@ def add_segment_at(start, end, name, perms_str="rwx", sclass="DATA"):
     # add_segm_ex(start, end, base, use32, align, comb, flags)
     # use32=1 means 32-bit addressing IFF 64-bit base is irrelevant for x64;
     # ADDSEG_OR_DIE makes it fail loudly on overlap.
-    ok = idc.add_segm_ex(start, end, 0, 1,
-                         idc.saAbs, idc.scPub, idc.ADDSEG_OR_DIE)
+    ok = idc.add_segm_ex(start, end, 0, 1, idc.saAbs, idc.scPub, idc.ADDSEG_OR_DIE)
     if not ok:
         _mcp_log(f"ADD SEGMENT 0x{start:08X}-0x{end:08X}: FAILED (overlap?)")
-        return {"success": False,
-                "error": "add_segm_ex failed (likely overlaps existing segment)"}
+        return {
+            "success": False,
+            "error": "add_segm_ex failed (likely overlaps existing segment)",
+        }
 
     seg = ida_segment.getseg(start)
     if not seg:
@@ -741,9 +889,17 @@ def add_segment_at(start, end, name, perms_str="rwx", sclass="DATA"):
     seg.perm = _perms_string_to_bits(perms_str)
     seg.update()
 
-    _mcp_log(f"ADD SEGMENT 0x{start:08X}-0x{end:08X} ({name}, {perms_str}, {sclass})", start)
-    return {"success": True, "start": f"0x{start:08X}", "end": f"0x{end:08X}",
-            "name": name, "perms": perms_str, "class": sclass}
+    _mcp_log(
+        f"ADD SEGMENT 0x{start:08X}-0x{end:08X} ({name}, {perms_str}, {sclass})", start
+    )
+    return {
+        "success": True,
+        "start": f"0x{start:08X}",
+        "end": f"0x{end:08X}",
+        "name": name,
+        "perms": perms_str,
+        "class": sclass,
+    }
 
 
 def set_segment_attrs_at(addr, name=None, perms_str=None, sclass=None):
@@ -765,7 +921,10 @@ def set_segment_attrs_at(addr, name=None, perms_str=None, sclass=None):
         changes.append(f"class={sclass}")
 
     if not changes:
-        return {"success": False, "error": "Nothing to change (provide name/perms/class)"}
+        return {
+            "success": False,
+            "error": "Nothing to change (provide name/perms/class)",
+        }
 
     _mcp_log(f"SET SEGMENT 0x{addr:08X}: {', '.join(changes)}", addr)
     return {"success": True, "address": f"0x{addr:08X}", "changes": changes}
@@ -786,6 +945,7 @@ def set_segment_attrs_at(addr, name=None, perms_str=None, sclass=None):
 # Read operations (memory, regs, callstack) auto-suspend a running
 # debuggee, read, and resume. Write operations require explicit pause.
 # ---------------------------------------------------------------------------
+
 
 def _dbg_state_string():
     """Translate IDA's debugger state enum into a human-readable string.
@@ -835,7 +995,9 @@ def dbg_state():
         except Exception:
             pass
         try:
-            out["pc"] = f"0x{idc.get_reg_value('rip' if ida_ida.inf_is_64bit() else 'eip'):X}"
+            out["pc"] = (
+                f"0x{idc.get_reg_value('rip' if ida_ida.inf_is_64bit() else 'eip'):X}"
+            )
         except Exception:
             pass
     return out
@@ -865,9 +1027,11 @@ def _refuse_if_debugging(endpoint_name):
     you still need to continue debugging.
     """
     if _dbg_state_string() in ("paused", "running"):
-        return {"error": f"{endpoint_name} blocked: debugger is "
-                         f"{_dbg_state_string()}. Call dbg_detach first, "
-                         f"apply the change, then re-attach if needed."}
+        return {
+            "error": f"{endpoint_name} blocked: debugger is "
+            f"{_dbg_state_string()}. Call dbg_detach first, "
+            f"apply the change, then re-attach if needed."
+        }
     return None
 
 
@@ -894,14 +1058,14 @@ def _auto_suspend_and_run(fn):
 
 # ---- attach / launch / detach ----
 
-_DOPT_EXCDLG_MASK = 0x3000   # bits controlling exception-dialog mode
-_EXCDLG_NEVER    = 0x0000   # never show modal "Exception happened" dialog
+_DOPT_EXCDLG_MASK = 0x3000  # bits controlling exception-dialog mode
+_EXCDLG_NEVER = 0x0000  # never show modal "Exception happened" dialog
 
 # exception_info_t flags (ida_dbg / idd.hpp)
-_EXC_BREAK   = 0x0001   # break execution on exception
-_EXC_HANDLE  = 0x0002   # pass to debuggee's own handler (SEH chain)
-_EXC_MSG     = 0x0004   # display a message
-_EXC_SILENT  = 0x0008   # don't display anything
+_EXC_BREAK = 0x0001  # break execution on exception
+_EXC_HANDLE = 0x0002  # pass to debuggee's own handler (SEH chain)
+_EXC_MSG = 0x0004  # display a message
+_EXC_SILENT = 0x0008  # don't display anything
 
 
 def _pass_all_exceptions():
@@ -939,14 +1103,21 @@ def _pass_all_exceptions():
                     exc.flags = new_flags
                     ida_dbg.set_exception_info(exc)
                     changed += 1
-            _mcp_log(f"DBG pass-through (per-exception API): set {changed}/{n} exception types")
+            _mcp_log(
+                "DBG pass-through (per-exception API): set "
+                f"{changed}/{n} exception types"
+            )
             return changed
         except Exception as e:
-            _mcp_log(f"DBG pass-through (per-exception) failed: {type(e).__name__}: {e}")
+            _mcp_log(
+                f"DBG pass-through (per-exception) failed: {type(e).__name__}: {e}"
+            )
 
     # --- Method 2: vector form (older IDA) ---
-    for get_name, set_name in (("get_exceptions", "set_exceptions"),
-                                ("dbg_get_exceptions", "dbg_set_exceptions")):
+    for get_name, set_name in (
+        ("get_exceptions", "set_exceptions"),
+        ("dbg_get_exceptions", "dbg_set_exceptions"),
+    ):
         getter = getattr(ida_dbg, get_name, None)
         setter = getattr(ida_dbg, set_name, None)
         if not (getter and setter):
@@ -962,10 +1133,15 @@ def _pass_all_exceptions():
                     exc.flags = new_flags
                     changed += 1
             setter(excs)
-            _mcp_log(f"DBG pass-through (vector API): set {changed}/{len(excs)} exception types")
+            _mcp_log(
+                "DBG pass-through (vector API): set "
+                f"{changed}/{len(excs)} exception types"
+            )
             return changed
         except Exception as e:
-            _mcp_log(f"DBG pass-through (vector {get_name}) failed: {type(e).__name__}: {e}")
+            _mcp_log(
+                f"DBG pass-through (vector {get_name}) failed: {type(e).__name__}: {e}"
+            )
 
     _mcp_log("DBG pass-through: NO exception API surface found in ida_dbg")
     return 0
@@ -982,7 +1158,9 @@ def _silence_debugger():
         new_opts = (opts & ~_DOPT_EXCDLG_MASK) | _EXCDLG_NEVER
         if new_opts != opts:
             ida_dbg.set_debugger_options(new_opts)
-            _mcp_log(f"DBG silenced exception dialog (opts 0x{opts:x} -> 0x{new_opts:x})")
+            _mcp_log(
+                f"DBG silenced exception dialog (opts 0x{opts:x} -> 0x{new_opts:x})"
+            )
     except Exception as e:
         _mcp_log(f"DBG dialog silence failed: {type(e).__name__}: {e}")
     _pass_all_exceptions()
@@ -1035,6 +1213,7 @@ def dbg_terminate():
 
 # ---- run-state control ----
 
+
 def dbg_run():
     """Continue execution (synonym for dbg_continue)."""
     return dbg_continue()
@@ -1053,7 +1232,8 @@ def dbg_pause():
 def dbg_continue():
     """Resume the paused debuggee."""
     err = _require_paused()
-    if err: return err
+    if err:
+        return err
     _mcp_log("DBG CONTINUE")
     ida_dbg.continue_process()
     return {"success": True, "state": _dbg_state_string()}
@@ -1062,7 +1242,8 @@ def dbg_continue():
 def dbg_step_into():
     """Single-step into. Returns the new PC."""
     err = _require_paused()
-    if err: return err
+    if err:
+        return err
     _mcp_log("DBG STEP INTO")
     ida_dbg.step_into()
     ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, 5)
@@ -1072,7 +1253,8 @@ def dbg_step_into():
 def dbg_step_over():
     """Single-step over (treats call as one instruction). Returns new PC."""
     err = _require_paused()
-    if err: return err
+    if err:
+        return err
     _mcp_log("DBG STEP OVER")
     ida_dbg.step_over()
     ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, 5)
@@ -1082,7 +1264,8 @@ def dbg_step_over():
 def dbg_step_out(timeout_s=30):
     """Step out of current function — same as 'run until return'."""
     err = _require_paused()
-    if err: return err
+    if err:
+        return err
     _mcp_log("DBG STEP OUT / RUN UNTIL RET")
     ida_dbg.step_until_ret()
     ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, timeout_s)
@@ -1092,7 +1275,8 @@ def dbg_step_out(timeout_s=30):
 def dbg_run_to(addr, timeout_s=30):
     """Continue until the debuggee hits addr."""
     err = _require_paused()
-    if err: return err
+    if err:
+        return err
     _mcp_log(f"DBG RUN TO 0x{addr:X}")
     ida_dbg.run_to(addr)
     ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, timeout_s)
@@ -1102,11 +1286,11 @@ def dbg_run_to(addr, timeout_s=30):
 # ---- breakpoints ----
 
 _BPT_TYPES = {
-    "sw":       0,  # software exec BP (int3)
-    "hw_exec":  4,  # hardware exec
+    "sw": 0,  # software exec BP (int3)
+    "hw_exec": 4,  # hardware exec
     "hw_write": 1,  # hardware write watch
-    "hw_read":  3,  # hardware r/w watch
-    "hw_rw":    3,  # alias
+    "hw_read": 3,  # hardware r/w watch
+    "hw_rw": 3,  # alias
 }
 
 
@@ -1156,11 +1340,28 @@ def dbg_del_breakpoint(addr):
 #   dbg_get_trace_log()  # pull all dumps in one call
 # ---------------------------------------------------------------------------
 
-_TRACE_BPS = {}   # ea -> {label, addr_reg, size_reg}
-_TRACE_LOG = []   # list of dump records
+_TRACE_BPS = {}  # ea -> {label, addr_reg, size_reg}
+_TRACE_LOG = []  # list of dump records
 _TRACE_HOOK = None
-_TRACE_REGS = ("rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
-               "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip")
+_TRACE_REGS = (
+    "rax",
+    "rcx",
+    "rdx",
+    "rbx",
+    "rsp",
+    "rbp",
+    "rsi",
+    "rdi",
+    "r8",
+    "r9",
+    "r10",
+    "r11",
+    "r12",
+    "r13",
+    "r14",
+    "r15",
+    "rip",
+)
 
 
 def _trace_capture(cfg, bptea, tid):
@@ -1222,14 +1423,18 @@ def _trace_capture(cfg, bptea, tid):
                         continue
                     data = idc.read_dbg_memory(ptr, sz)
                     if data:
-                        dumps[reg] = {"ptr": f"0x{ptr:X}", "size": sz,
-                                      "data": data.hex()}
+                        dumps[reg] = {
+                            "ptr": f"0x{ptr:X}",
+                            "size": sz,
+                            "data": data.hex(),
+                        }
                     else:
-                        dumps[reg] = {"ptr": f"0x{ptr:X}", "size": sz,
-                                      "data": ""}
+                        dumps[reg] = {"ptr": f"0x{ptr:X}", "size": sz, "data": ""}
                 except Exception as e:
-                    dumps[reg] = {"ptr": f"0x{ptr:X}" if 'ptr' in locals() else "?",
-                                  "error": f"{type(e).__name__}: {e}"}
+                    dumps[reg] = {
+                        "ptr": f"0x{ptr:X}" if "ptr" in locals() else "?",
+                        "error": f"{type(e).__name__}: {e}",
+                    }
             record["fixed_dumps"] = dumps
     except Exception as e:
         record["error"] = f"{type(e).__name__}: {e}"
@@ -1249,9 +1454,13 @@ class _TraceBptHook(ida_dbg.DBG_Hooks):
         try:
             _TRACE_LOG.append(_trace_capture(cfg, bptea, tid))
         except Exception as e:
-            _TRACE_LOG.append({"label": cfg.get("label", ""),
-                               "ea": f"0x{bptea:X}",
-                               "error": f"hook: {type(e).__name__}: {e}"})
+            _TRACE_LOG.append(
+                {
+                    "label": cfg.get("label", ""),
+                    "ea": f"0x{bptea:X}",
+                    "error": f"hook: {type(e).__name__}: {e}",
+                }
+            )
         return 1  # BPTEVAL_NOSTOP — IDA does not pause
 
 
@@ -1267,8 +1476,7 @@ def _ensure_trace_hook():
 _BPT_BRK = 0x001  # "break on hit" flag on a bpt_t
 
 
-def dbg_set_trace_bp(addr, label="", addr_reg="r8", size_reg="r9",
-                     fixed_dumps=None):
+def dbg_set_trace_bp(addr, label="", addr_reg="r8", size_reg="r9", fixed_dumps=None):
     """Arm a non-pausing trace BP. On hit, dumps registers + memory
     pointed to by addr_reg/size_reg AND/OR fixed_dumps regions, appends
     to the trace log, and auto-continues.
@@ -1308,22 +1516,31 @@ def dbg_set_trace_bp(addr, label="", addr_reg="r8", size_reg="r9",
             idc.set_bpt_attr(ea, idc.BPTATTR_FLAGS, new_flags)
             cleared_brk = True
     except Exception as e:
-        _mcp_log(f"TRACE BP could not clear BPT_BRK at 0x{ea:X}: "
-                 f"{type(e).__name__}: {e}")
+        _mcp_log(
+            f"TRACE BP could not clear BPT_BRK at 0x{ea:X}: {type(e).__name__}: {e}"
+        )
 
-    _TRACE_BPS[ea] = {"label": label,
-                      "addr_reg": addr_reg,
-                      "size_reg": size_reg,
-                      "fixed_dumps": fixed_dumps or []}
-    _mcp_log(f"TRACE BP+ 0x{ea:X} label='{label}' "
-             f"addr_reg={addr_reg} size_reg={size_reg} "
-             f"fixed_dumps={len(fixed_dumps or [])} "
-             f"brk_cleared={cleared_brk}")
-    return {"success": True, "address": f"0x{ea:X}",
-            "label": label, "bp_added": bool(ok),
-            "brk_cleared": cleared_brk,
-            "fixed_dumps": fixed_dumps or [],
-            "note": "non-pausing — call dbg_get_trace_log to retrieve hits"}
+    _TRACE_BPS[ea] = {
+        "label": label,
+        "addr_reg": addr_reg,
+        "size_reg": size_reg,
+        "fixed_dumps": fixed_dumps or [],
+    }
+    _mcp_log(
+        f"TRACE BP+ 0x{ea:X} label='{label}' "
+        f"addr_reg={addr_reg} size_reg={size_reg} "
+        f"fixed_dumps={len(fixed_dumps or [])} "
+        f"brk_cleared={cleared_brk}"
+    )
+    return {
+        "success": True,
+        "address": f"0x{ea:X}",
+        "label": label,
+        "bp_added": bool(ok),
+        "brk_cleared": cleared_brk,
+        "fixed_dumps": fixed_dumps or [],
+        "note": "non-pausing — call dbg_get_trace_log to retrieve hits",
+    }
 
 
 def dbg_clear_trace_bp(addr):
@@ -1359,31 +1576,37 @@ def dbg_list_breakpoints():
     for i in range(n):
         bpt = ida_dbg.bpt_t()
         if ida_dbg.getn_bpt(i, bpt):
-            bpts.append({
-                "address": f"0x{bpt.ea:X}",
-                "size": bpt.size,
-                "type": bpt.type,
-                "enabled": bool(bpt.flags & ida_dbg.BPT_ENABLED),
-            })
+            bpts.append(
+                {
+                    "address": f"0x{bpt.ea:X}",
+                    "size": bpt.size,
+                    "type": bpt.type,
+                    "enabled": bool(bpt.flags & ida_dbg.BPT_ENABLED),
+                }
+            )
     return {"breakpoints": bpts}
 
 
 # ---- memory + registers ----
 
+
 def dbg_read_memory(addr, size):
     """Read live debuggee memory. Auto-pauses if running."""
+
     def _do():
         data = idc.read_dbg_memory(addr, min(size, 65536))
         if data is None:
             return {"error": f"read failed at 0x{addr:X}"}
         return {"address": f"0x{addr:X}", "size": len(data), "hex": data.hex()}
+
     return _auto_suspend_and_run(_do)
 
 
 def dbg_write_memory(addr, hex_data):
     """Write live debuggee memory. Requires paused."""
     err = _require_paused()
-    if err: return err
+    if err:
+        return err
     try:
         data = bytes.fromhex(hex_data)
     except ValueError:
@@ -1395,19 +1618,22 @@ def dbg_write_memory(addr, hex_data):
 
 def dbg_get_reg(name):
     """Read a single register from the debuggee."""
+
     def _do():
         try:
             v = idc.get_reg_value(name)
             return {"name": name, "value": f"0x{v:X}"}
         except Exception as e:
             return {"error": f"{type(e).__name__}: {e}"}
+
     return _auto_suspend_and_run(_do)
 
 
 def dbg_set_reg(name, value):
     """Write a single register. Requires paused."""
     err = _require_paused()
-    if err: return err
+    if err:
+        return err
     idc.set_reg_value(value, name)
     _mcp_log(f"DBG SET REG {name} = 0x{value:X}")
     return {"success": True, "name": name, "value": f"0x{value:X}"}
@@ -1416,10 +1642,39 @@ def dbg_set_reg(name, value):
 def dbg_get_regs():
     """Return all GP registers of the current thread (auto-pauses)."""
     if ida_ida.inf_is_64bit():
-        names = ["rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp","rip",
-                 "r8","r9","r10","r11","r12","r13","r14","r15","eflags"]
+        names = [
+            "rax",
+            "rbx",
+            "rcx",
+            "rdx",
+            "rsi",
+            "rdi",
+            "rbp",
+            "rsp",
+            "rip",
+            "r8",
+            "r9",
+            "r10",
+            "r11",
+            "r12",
+            "r13",
+            "r14",
+            "r15",
+            "eflags",
+        ]
     else:
-        names = ["eax","ebx","ecx","edx","esi","edi","ebp","esp","eip","eflags"]
+        names = [
+            "eax",
+            "ebx",
+            "ecx",
+            "edx",
+            "esi",
+            "edi",
+            "ebp",
+            "esp",
+            "eip",
+            "eflags",
+        ]
 
     def _do():
         out = {}
@@ -1429,10 +1684,12 @@ def dbg_get_regs():
             except Exception:
                 out[n] = "?"
         return {"registers": out}
+
     return _auto_suspend_and_run(_do)
 
 
 # ---- event poll ----
+
 
 def dbg_wait_event(timeout_s=30):
     """Block until the next debug event (BP hit, exception, exit, ...).
@@ -1440,19 +1697,24 @@ def dbg_wait_event(timeout_s=30):
     Returns {event, code, pc, message} describing what happened. Useful for
     'continue then wait for next BP'.
     """
-    code = ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP | ida_dbg.WFNE_NOWAIT,
-                                       0) if timeout_s == 0 else \
-           ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, timeout_s)
+    code = (
+        ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP | ida_dbg.WFNE_NOWAIT, 0)
+        if timeout_s == 0
+        else ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, timeout_s)
+    )
     out = {"event_code": int(code), "state": _dbg_state_string()}
     try:
         if _dbg_state_string() == "paused":
-            out["pc"] = f"0x{idc.get_reg_value('rip' if ida_ida.inf_is_64bit() else 'eip'):X}"
+            out["pc"] = (
+                f"0x{idc.get_reg_value('rip' if ida_ida.inf_is_64bit() else 'eip'):X}"
+            )
     except Exception:
         pass
     return out
 
 
 # ---- callstack / threads / modules ----
+
 
 def dbg_callstack():
     """Return the current thread's call stack frames.
@@ -1467,6 +1729,7 @@ def dbg_callstack():
     builds, which most modern MSVC code is) but better than nothing for
     the cases where it DOES work.
     """
+
     def _do():
         try:
             tid = idc.get_current_thread()
@@ -1482,7 +1745,9 @@ def dbg_callstack():
                 except Exception:
                     continue
             fn = getattr(mod, "collect_stacktrace", None)
-            cls = getattr(ida_idd, "call_stack_t", None) or getattr(mod, "call_stack_t", None)
+            cls = getattr(ida_idd, "call_stack_t", None) or getattr(
+                mod, "call_stack_t", None
+            )
             if not (fn and cls):
                 continue
             try:
@@ -1494,15 +1759,20 @@ def dbg_callstack():
                 for i in range(trace.size()):
                     f = trace.at(i)
                     pc = int(f.pc)
-                    frames.append({
-                        "depth": i,
-                        "pc": f"0x{pc:X}",
-                        "fp": f"0x{int(f.fp):X}" if hasattr(f, "fp") else "0",
-                        "name": ida_name.get_name(pc) or "",
-                    })
+                    frames.append(
+                        {
+                            "depth": i,
+                            "pc": f"0x{pc:X}",
+                            "fp": f"0x{int(f.fp):X}" if hasattr(f, "fp") else "0",
+                            "name": ida_name.get_name(pc) or "",
+                        }
+                    )
                 return {"frames": frames, "method": f"{mod_name}.collect_stacktrace"}
             except Exception as e:
-                _mcp_log(f"DBG callstack via {mod_name}.collect_stacktrace failed: {type(e).__name__}: {e}")
+                _mcp_log(
+                    f"DBG callstack via {mod_name}.collect_stacktrace failed: "
+                    f"{type(e).__name__}: {e}"
+                )
                 continue
 
         # Fallback: walk the RBP chain manually. Works only when the
@@ -1513,12 +1783,14 @@ def dbg_callstack():
             frames = []
             rip = ida_dbg.get_reg_val("rip")
             rbp = ida_dbg.get_reg_val("rbp")
-            frames.append({
-                "depth": 0,
-                "pc": f"0x{rip:X}",
-                "fp": f"0x{rbp:X}",
-                "name": ida_name.get_name(rip) or "",
-            })
+            frames.append(
+                {
+                    "depth": 0,
+                    "pc": f"0x{rip:X}",
+                    "fp": f"0x{rbp:X}",
+                    "name": ida_name.get_name(rip) or "",
+                }
+            )
             # Walk a few frames; stop if pointers look bogus.
             for depth in range(1, 32):
                 if rbp == 0 or rbp < 0x10000 or rbp > 0x00007FFFFFFFFFFF:
@@ -1533,22 +1805,31 @@ def dbg_callstack():
                 rbp = int.from_bytes(next_bp_bytes, "little")
                 if ret == 0:
                     break
-                frames.append({
-                    "depth": depth,
-                    "pc": f"0x{ret:X}",
-                    "fp": f"0x{rbp:X}",
-                    "name": ida_name.get_name(ret) or "",
-                })
-            return {"frames": frames, "method": "manual_rbp_walk",
-                    "note": "best-effort — unreliable on /Oy code"}
+                frames.append(
+                    {
+                        "depth": depth,
+                        "pc": f"0x{ret:X}",
+                        "fp": f"0x{rbp:X}",
+                        "name": ida_name.get_name(ret) or "",
+                    }
+                )
+            return {
+                "frames": frames,
+                "method": "manual_rbp_walk",
+                "note": "best-effort — unreliable on /Oy code",
+            }
         except Exception as e:
-            return {"error": f"manual walk failed: {type(e).__name__}: {e}",
-                    "frames": []}
+            return {
+                "error": f"manual walk failed: {type(e).__name__}: {e}",
+                "frames": [],
+            }
+
     return _auto_suspend_and_run(_do)
 
 
 def dbg_threads():
     """List threads in the debuggee."""
+
     def _do():
         out = []
         n = idc.get_thread_qty()
@@ -1556,6 +1837,7 @@ def dbg_threads():
             tid = idc.getn_thread(i)
             out.append({"index": i, "tid": tid})
         return {"threads": out}
+
     return _auto_suspend_and_run(_do)
 
 
@@ -1565,21 +1847,25 @@ def dbg_modules():
     modinfo_t lives in ida_idd, not ida_dbg. get_first_module/get_next_module
     are on ida_dbg though.
     """
+
     def _do():
         out = []
         try:
             mod = ida_idd.modinfo_t()
             ok = ida_dbg.get_first_module(mod)
             while ok:
-                out.append({
-                    "name": mod.name,
-                    "base": f"0x{mod.base:X}",
-                    "size": mod.size,
-                })
+                out.append(
+                    {
+                        "name": mod.name,
+                        "base": f"0x{mod.base:X}",
+                        "size": mod.size,
+                    }
+                )
                 ok = ida_dbg.get_next_module(mod)
         except Exception as e:
             return {"error": f"{type(e).__name__}: {e}", "modules": out}
         return {"modules": out}
+
     return _auto_suspend_and_run(_do)
 
 
@@ -1591,15 +1877,23 @@ def dbg_modules():
 # annotate state as you discover it.
 # ---------------------------------------------------------------------------
 
+
 def rename_local_var(func_addr, old_name, new_name):
     """Rename a Hex-Rays local variable in a function."""
     if not ida_hexrays.init_hexrays_plugin():
         return {"success": False, "error": "Hex-Rays not available"}
     ok = ida_hexrays.rename_lvar(func_addr, old_name, new_name)
-    _mcp_log(f"LVAR RENAME 0x{func_addr:X} {old_name} -> {new_name}: "
-             f"{'OK' if ok else 'FAILED'}", func_addr)
-    return {"success": bool(ok), "function": f"0x{func_addr:X}",
-            "old_name": old_name, "new_name": new_name}
+    _mcp_log(
+        f"LVAR RENAME 0x{func_addr:X} {old_name} -> {new_name}: "
+        f"{'OK' if ok else 'FAILED'}",
+        func_addr,
+    )
+    return {
+        "success": bool(ok),
+        "function": f"0x{func_addr:X}",
+        "old_name": old_name,
+        "new_name": new_name,
+    }
 
 
 def set_local_var_type(func_addr, var_name, type_decl):
@@ -1609,17 +1903,24 @@ def set_local_var_type(func_addr, var_name, type_decl):
 
     tif = ida_typeinf.tinfo_t()
     decl = type_decl.strip()
-    if not decl.endswith(';'):
-        decl = decl + ' x;'  # parse_decl wants a complete declaration
-    parsed_name = ida_typeinf.parse_decl(tif, None, decl, ida_typeinf.PT_SIL)
+    if not decl.endswith(";"):
+        decl = decl + " x;"  # parse_decl wants a complete declaration
+    ida_typeinf.parse_decl(tif, None, decl, ida_typeinf.PT_SIL)
     if not tif.is_well_defined():
         return {"success": False, "error": f"could not parse type: {type_decl}"}
 
     ok = ida_hexrays.set_lvar_type(func_addr, var_name, tif)
-    _mcp_log(f"LVAR TYPE 0x{func_addr:X} {var_name} = {type_decl}: "
-             f"{'OK' if ok else 'FAILED'}", func_addr)
-    return {"success": bool(ok), "function": f"0x{func_addr:X}",
-            "name": var_name, "type": type_decl}
+    _mcp_log(
+        f"LVAR TYPE 0x{func_addr:X} {var_name} = {type_decl}: "
+        f"{'OK' if ok else 'FAILED'}",
+        func_addr,
+    )
+    return {
+        "success": bool(ok),
+        "function": f"0x{func_addr:X}",
+        "name": var_name,
+        "type": type_decl,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1632,7 +1933,7 @@ def set_local_var_type(func_addr, var_name, type_decl):
 # ---------------------------------------------------------------------------
 
 _SCRATCH_NETNODE_NAME = "$ reversing_mcp_scratch"
-_SCRATCH_TAG = ord('M')  # blob tag — "M" for MCP
+_SCRATCH_TAG = ord("M")  # blob tag — "M" for MCP
 
 
 def _scratch_node():
@@ -1664,7 +1965,9 @@ def scratch_replace(content):
     """
     try:
         node = _scratch_node()
-        text = content if isinstance(content, str) else content.decode("utf-8", "replace")
+        text = (
+            content if isinstance(content, str) else content.decode("utf-8", "replace")
+        )
         data = text.encode("utf-8")
         node.setblob(data, 0, _SCRATCH_TAG)
         _mcp_log(f"SCRATCH REPLACE: {len(data)} bytes")
@@ -1743,6 +2046,7 @@ _ADDR_RE = re.compile(r"(?<![\w/])(0x[0-9a-fA-F]{3,}|sub_[0-9a-fA-F]+)(?!\w)")
 
 def _expand_md_macros(md):
     """Expand {{decompile:0xADDR}} → fenced C code block with live pseudocode."""
+
     def _replace_decompile(m):
         try:
             ea = int(m.group(1), 16)
@@ -1753,6 +2057,7 @@ def _expand_md_macros(md):
             return f"`[decompile 0x{m.group(1)}: {err}]`"
         except Exception as e:
             return f"`[decompile 0x{m.group(1)}: {type(e).__name__}: {e}]`"
+
     return _DECOMPILE_RE.sub(_replace_decompile, md)
 
 
@@ -1775,6 +2080,7 @@ def _ensure_markdown():
         return _MARKDOWN_PKG
     try:
         import markdown as _md
+
         _MARKDOWN_PKG = _md
         _MARKDOWN_INSTALL_STATE = "ok"
         return _md
@@ -1791,17 +2097,35 @@ def _ensure_markdown():
         try:
             import subprocess
             import sys as _sys
-            ida_kernwin.msg("[MCP] Installing `markdown` package into IDA's Python (background)...\n")
+
+            ida_kernwin.msg(
+                "[MCP] Installing `markdown` package into IDA's Python "
+                "(background)...\n"
+            )
             subprocess.check_call(
-                [_sys.executable, "-m", "pip", "install", "--user", "--quiet", "markdown"],
+                [
+                    _sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--user",
+                    "--quiet",
+                    "markdown",
+                ],
             )
             import markdown as _md
+
             _MARKDOWN_PKG = _md
             _MARKDOWN_INSTALL_STATE = "ok"
-            ida_kernwin.msg("[MCP] `markdown` installed OK — viewer will pick it up on next render.\n")
+            ida_kernwin.msg(
+                "[MCP] `markdown` installed OK — viewer will pick it up on "
+                "next render.\n"
+            )
         except Exception as e:
             _MARKDOWN_INSTALL_STATE = "failed"
-            ida_kernwin.msg(f"[MCP] markdown auto-install failed: {type(e).__name__}: {e}\n")
+            ida_kernwin.msg(
+                f"[MCP] markdown auto-install failed: {type(e).__name__}: {e}\n"
+            )
 
     threading.Thread(target=_worker, name="mcp-markdown-install", daemon=True).start()
     return None
@@ -1819,21 +2143,32 @@ def _md_to_html(md):
     pkg = _ensure_markdown()
     if pkg is None:
         if _MARKDOWN_INSTALL_STATE == "installing":
-            body = ("<h2 style='color:#dcdcaa;'>Installing markdown package…</h2>"
-                    "<p>Auto-install kicked off in a background thread. "
-                    "Viewer will re-render on next scratch write or "
-                    "<code>scratch_refresh</code> call.</p>")
+            body = (
+                "<h2 style='color:#dcdcaa;'>Installing markdown package…</h2>"
+                "<p>Auto-install kicked off in a background thread. "
+                "Viewer will re-render on next scratch write or "
+                "<code>scratch_refresh</code> call.</p>"
+            )
         else:
             body = _missing_markdown_html()
     else:
         try:
             body = pkg.markdown(expanded, extensions=_MD_EXTENSIONS)
         except Exception as e:
-            body = ("<pre style='color:#f48771;'>markdown render error: "
-                    + html_escape(f"{type(e).__name__}: {e}") + "</pre>"
-                    "<pre>" + html_escape(expanded) + "</pre>")
+            body = (
+                "<pre style='color:#f48771;'>markdown render error: "
+                + html_escape(f"{type(e).__name__}: {e}")
+                + "</pre>"
+                "<pre>" + html_escape(expanded) + "</pre>"
+            )
     body = _autolink_addresses(body)
-    return "<html><head><style>" + _DARK_CSS + "</style></head><body>" + body + "</body></html>"
+    return (
+        "<html><head><style>"
+        + _DARK_CSS
+        + "</style></head><body>"
+        + body
+        + "</body></html>"
+    )
 
 
 def _missing_markdown_html():
@@ -1847,7 +2182,8 @@ def _missing_markdown_html():
         "issue inside IDA's bundled Python).</p>"
         "<p>To install it manually, open IDA's Python console and run:</p>"
         "<pre><code>import subprocess, sys\n"
-        "subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--user', 'markdown'])</code></pre>"
+        "subprocess.check_call([sys.executable, '-m', 'pip', 'install', "
+        "'--user', 'markdown'])</code></pre>"
         "<p>Then close + re-open the viewer (Ctrl+Shift+N).</p>"
     )
 
@@ -1867,9 +2203,9 @@ def _autolink_addresses(html):
             out.append(_ADDR_RE.sub(_addr_link, html[i:]))
             break
         # Make sure it's the <a tag, not <abbr or <article
-        next_char = html[a_start + 2:a_start + 3]
+        next_char = html[a_start + 2 : a_start + 3]
         if next_char not in (" ", ">", "\t", "\n"):
-            out.append(_ADDR_RE.sub(_addr_link, html[i:a_start + 1]))
+            out.append(_ADDR_RE.sub(_addr_link, html[i : a_start + 1]))
             i = a_start + 1
             continue
         out.append(_ADDR_RE.sub(_addr_link, html[i:a_start]))
@@ -1979,7 +2315,9 @@ class _NotebookViewer(ida_kernwin.PluginForm):
         if self._browser is None:
             return
         was_at_bottom = not self._user_scrolled_away
-        html = _md_to_html(md or "_(notebook is empty — call `scratch_log` to add a section)_")
+        html = _md_to_html(
+            md or "_(notebook is empty — call `scratch_log` to add a section)_"
+        )
         self._browser.setHtml(html)
         if was_at_bottom:
             sb = self._browser.verticalScrollBar()
@@ -2017,7 +2355,10 @@ def scratch_refresh():
     for the next scratch write.
     """
     if _viewer is None or _viewer._browser is None:
-        return {"success": False, "error": "Viewer not open — call scratch_show first"}
+        return {
+            "success": False,
+            "error": "Viewer not open — call scratch_show first",
+        }
     try:
         _viewer._render_now()
         return {"success": True, "refreshed": True}
@@ -2026,7 +2367,7 @@ def scratch_refresh():
 
 
 def upload_file(filename: str, data_b64: str, spawn: bool = False) -> dict:
-    """Save base64-encoded bytes to ~/.ida_mcp/uploads/ and optionally open in a new IDA."""
+    """Save bytes under ~/.ida_mcp/uploads/ and optionally open them in IDA."""
     import base64
     import subprocess
 
@@ -2050,12 +2391,15 @@ def upload_file(filename: str, data_b64: str, spawn: bool = False) -> dict:
         # sys.argv[0] is the IDA executable (ida64.exe on Windows, ida64 on Unix)
         ida_bin = sys.argv[0] if sys.argv else None
         if not ida_bin or not os.path.isfile(ida_bin):
-            result["spawn_error"] = f"Cannot locate IDA binary (sys.argv[0]={sys.argv[0]!r})"
+            result["spawn_error"] = (
+                f"Cannot locate IDA binary (sys.argv[0]={sys.argv[0]!r})"
+            )
             return result
         try:
             if sys.platform == "win32":
                 popen_kwargs = {
-                    "creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    "creationflags": subprocess.DETACHED_PROCESS
+                    | subprocess.CREATE_NEW_PROCESS_GROUP,
                 }
             else:
                 popen_kwargs = {
@@ -2078,6 +2422,7 @@ def upload_file(filename: str, data_b64: str, spawn: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 # HTTP request handler
 # ---------------------------------------------------------------------------
+
 
 def _parse_addr(s):
     """Parse an address string (hex with optional 0x prefix)."""
@@ -2116,6 +2461,8 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         try:
             if path == "/info":
                 result = _run_on_main_thread(get_idb_info)
+            elif path == "/capabilities":
+                result = _run_on_main_thread(get_capabilities)
             elif path == "/segments":
                 result = _run_on_main_thread(get_segments)
             else:
@@ -2132,7 +2479,10 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 
         try:
             result = _run_on_main_thread(
-                self._dispatch, path, body, _mcp_label=path,
+                self._dispatch,
+                path,
+                body,
+                _mcp_label=path,
             )
             self._respond(result)
         except Exception as e:
@@ -2140,20 +2490,39 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 
     # Endpoints that mutate the IDB. Guarded against running while
     # the debugger is engaged — those re-entries can crash IDA.
-    _MUTATING = frozenset({
-        "/rename", "/comment", "/create_function", "/delete_function",
-        "/make_code", "/define_type", "/apply_type",
-        "/set_function_prototype", "/add_segment", "/set_segment_attrs",
-        "/rename_local_var", "/set_local_var_type",
-        "/scratch_replace", "/scratch_append", "/scratch_log", "/scratch_clear",
-    })
+    _MUTATING = frozenset(
+        {
+            "/rename",
+            "/comment",
+            "/create_function",
+            "/delete_function",
+            "/make_code",
+            "/define_type",
+            "/apply_type",
+            "/set_function_prototype",
+            "/add_segment",
+            "/set_segment_attrs",
+            "/rename_local_var",
+            "/set_local_var_type",
+            "/scratch_replace",
+            "/scratch_append",
+            "/scratch_log",
+            "/scratch_clear",
+            "/execute_python",
+        }
+    )
 
     # Endpoints whose body shouldn't be echoed in the audit log (too big,
     # or the body IS the content we'd be summarizing).
-    _NOLOG_BODY = frozenset({
-        "/scratch_replace", "/scratch_append", "/scratch_log",
-        "/dbg_write_memory",
-    })
+    _NOLOG_BODY = frozenset(
+        {
+            "/scratch_replace",
+            "/scratch_append",
+            "/scratch_log",
+            "/dbg_write_memory",
+            "/execute_python",
+        }
+    )
 
     # Print "took Xs" only when a single request actually ran for longer
     # than this. Anything below is normal IDA work.
@@ -2186,21 +2555,39 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 
         t0 = time.monotonic()
         try:
-            return self._dispatch_inner(path, body)
+            result = self._dispatch_inner(path, body)
+            succeeded = not isinstance(result, dict) or (
+                "error" not in result and result.get("success", True) is not False
+            )
+            save_script = path == "/execute_python" and body.get("save_after", True)
+            autosave = _HEADLESS and _AUTOSAVE_POLICY == "after_mutation"
+            if path in self._MUTATING and succeeded and (autosave or save_script):
+                saved = save_database()
+                if isinstance(result, dict):
+                    result["saved"] = "error" not in saved
+                    result["database_path"] = saved.get(
+                        "database_path", _database_path()
+                    )
+                    if "error" in saved:
+                        result["save_error"] = saved["error"]
+            return result
         finally:
             dt = time.monotonic() - t0
             if dt > self._SLOW_REQUEST_SEC:
                 ida_kernwin.msg(f"[MCP SLOW] {path} took {dt:.2f}s\n")
 
     def _dispatch_inner(self, path, body):
-
         if path == "/function":
             addr_str = body.get("address")
             name = body.get("name")
             if addr_str:
-                return get_function_at(_parse_addr(addr_str)) or {"error": "No function at address"}
+                return get_function_at(_parse_addr(addr_str)) or {
+                    "error": "No function at address"
+                }
             elif name:
-                return get_function_by_name(name) or {"error": f"Function '{name}' not found"}
+                return get_function_by_name(name) or {
+                    "error": f"Function '{name}' not found"
+                }
             return {"error": "Provide 'address' or 'name'"}
 
         elif path == "/disassemble":
@@ -2209,14 +2596,18 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             start = body.get("start")
             end = body.get("end")
             if start and end:
-                return {"lines": disassemble_range(_parse_addr(start), _parse_addr(end))}
+                return {
+                    "lines": disassemble_range(_parse_addr(start), _parse_addr(end))
+                }
             if name:
                 func = get_function_by_name(name)
                 if not func:
                     return {"error": f"Function '{name}' not found"}
                 addr_str = f"0x{func['start']:X}"
             if addr_str:
-                return disassemble_function(_parse_addr(addr_str)) or {"error": "No function at address"}
+                return disassemble_function(_parse_addr(addr_str)) or {
+                    "error": "No function at address"
+                }
             return {"error": "Provide 'address', 'name', or 'start'+'end'"}
 
         elif path == "/decompile":
@@ -2232,10 +2623,38 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             return {"error": "Provide 'address' or 'name'"}
 
         elif path == "/execute_python":
+            if not _ALLOW_PYTHON:
+                return {
+                    "error": (
+                        "IDAPython execution is disabled. Set "
+                        "IDA_MCP_ALLOW_PYTHON=1 before launching IDA."
+                    )
+                }
+            if BIND_HOST not in {"127.0.0.1", "localhost", "::1"}:
+                return {
+                    "error": (
+                        "IDAPython execution requires a loopback bind; "
+                        "set IDA_MCP_BIND=127.0.0.1"
+                    )
+                }
             code = body.get("code", "")
             if not code:
                 return {"error": "Provide 'code'"}
             return execute_python(code)
+
+        elif path == "/save_database":
+            return save_database(body.get("database_path", ""))
+
+        elif path == "/close_session":
+            save = body.get("save", True)
+            scheduled = schedule_close_session(save=bool(save))
+            return {
+                "success": True,
+                "closing": True,
+                "save": bool(save),
+                "database_path": _database_path(),
+                **scheduled,
+            }
 
         elif path == "/xrefs_to":
             addr_str = body.get("address")
@@ -2367,9 +2786,9 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             perms = body.get("perms", "rwx")
             sclass = body.get("class", "DATA")
             if start_str and end_str and name:
-                return add_segment_at(_parse_addr(start_str),
-                                      _parse_addr(end_str),
-                                      name, perms, sclass)
+                return add_segment_at(
+                    _parse_addr(start_str), _parse_addr(end_str), name, perms, sclass
+                )
             return {"error": "Provide 'start', 'end', and 'name'"}
 
         elif path == "/set_segment_attrs":
@@ -2428,16 +2847,17 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             addr_str = body.get("address")
             if not addr_str:
                 return {"error": "Provide 'address'"}
-            return dbg_run_to(_parse_addr(addr_str),
-                              int(body.get("timeout_s", 30)))
+            return dbg_run_to(_parse_addr(addr_str), int(body.get("timeout_s", 30)))
 
         elif path == "/dbg_set_breakpoint":
             addr_str = body.get("address")
             if not addr_str:
                 return {"error": "Provide 'address'"}
-            return dbg_set_breakpoint(_parse_addr(addr_str),
-                                      bp_type=body.get("type", "sw"),
-                                      size=int(body.get("size", 1)))
+            return dbg_set_breakpoint(
+                _parse_addr(addr_str),
+                bp_type=body.get("type", "sw"),
+                size=int(body.get("size", 1)),
+            )
 
         elif path == "/dbg_del_breakpoint":
             addr_str = body.get("address")
@@ -2580,6 +3000,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 # Registration
 # ---------------------------------------------------------------------------
 
+
 def _register(port):
     """Write registration file so the MCP server can discover us."""
     os.makedirs(REGISTRATION_DIR, exist_ok=True)
@@ -2588,8 +3009,16 @@ def _register(port):
         "pid": pid,
         "port": port,
         "host": ADVERTISE_HOST,
+        "session_id": f"ida-{pid}",
         "idb": _idb_name(),
         "idb_path": _idb_path(),
+        "provider": "ida",
+        "protocol_version": PROTOCOL_VERSION,
+        "mode": _MODE,
+        "source_path": _source_path(),
+        "database_path": _database_path(),
+        "autosave_policy": _AUTOSAVE_POLICY,
+        "capabilities": get_capabilities()["capabilities"],
     }
     path = os.path.join(REGISTRATION_DIR, f"{pid}.json")
     with open(path, "w") as f:
@@ -2614,6 +3043,7 @@ def _unregister():
 _server = None
 _thread = None
 _reg_path = None
+_closing = False
 
 
 _OPEN_NOTEBOOK_ACTION = "mcp:open_notebook"
@@ -2668,7 +3098,7 @@ def start_server():
 
     if not _HEADLESS:
         _register_notebook_action()
-        print(f"[MCP] Notebook viewer hotkey: Ctrl+Shift+N")
+        print("[MCP] Notebook viewer hotkey: Ctrl+Shift+N")
 
     print(f"[MCP] Server started on http://{ADVERTISE_HOST}:{port}  (bind={BIND_HOST})")
     print(f"[MCP] IDB: {_idb_name()}")
@@ -2688,10 +3118,55 @@ def stop_server():
 
     _server.shutdown()
     _unregister()
-    print(f"[MCP] Server stopped")
+    print("[MCP] Server stopped")
     _server = None
     _thread = None
     _reg_path = None
+
+
+def schedule_close_session(save=True):
+    """Close IDA after the HTTP response has had time to flush.
+
+    IDA owns the process lifecycle. We request its normal qexit path instead
+    of terminating the process, so plugin teardown and database finalization
+    remain under IDA's control.
+    """
+    global _closing
+    if _closing:
+        return {"already_closing": True}
+    _closing = True
+
+    def _close_after_response():
+        time.sleep(0.25)
+
+        def _close_on_main_thread():
+            global _closing
+            try:
+                if save:
+                    saved = save_database()
+                    if "error" in saved:
+                        ida_kernwin.msg(
+                            f"[MCP] SAVE BEFORE CLOSE FAILED: {saved['error']}\n"
+                        )
+                        _closing = False
+                        return 0
+                idc.qexit(0)
+            except Exception as exc:
+                _closing = False
+                ida_kernwin.msg(f"[MCP] CLOSE FAILED: {type(exc).__name__}: {exc}\n")
+            return 0
+
+        _run_on_main_thread(
+            _close_on_main_thread,
+            _mcp_label="close_session",
+        )
+
+    threading.Thread(
+        target=_close_after_response,
+        name="mcp-close-session",
+        daemon=True,
+    ).start()
+    return {"already_closing": False}
 
 
 def reload_plugin():
@@ -2731,7 +3206,10 @@ def reload_plugin():
                 # Loaded as a Script File rather than a plugin — find the
                 # right entry in sys.modules by attribute matching.
                 for name, mod in list(sys.modules.items()):
-                    if getattr(mod, "_SCRATCH_NETNODE_NAME", None) == _SCRATCH_NETNODE_NAME:
+                    if (
+                        getattr(mod, "_SCRATCH_NETNODE_NAME", None)
+                        == _SCRATCH_NETNODE_NAME
+                    ):
                         mod_name = name
                         break
 
@@ -2746,16 +3224,20 @@ def reload_plugin():
             # call it through the reloaded namespace to ensure we use
             # the new code.
             mod.start_server()
-            print(f"[MCP] reload: done — running new code")
+            print("[MCP] reload: done — running new code")
         except Exception as e:
             traceback.print_exc()
             print(f"[MCP] reload FAILED: {type(e).__name__}: {e}")
 
-    threading.Thread(target=_do_reload, name="mcp-reload",
-                     daemon=True).start()
-    return {"success": True,
-            "scheduled": "reload starts in 0.5s",
-            "note": "server stops, module re-imports from disk, server restarts. BPs + scratch persist."}
+    threading.Thread(target=_do_reload, name="mcp-reload", daemon=True).start()
+    return {
+        "success": True,
+        "scheduled": "reload starts in 0.5s",
+        "note": (
+            "server stops, module re-imports from disk, server restarts. "
+            "BPs + scratch persist."
+        ),
+    }
 
 
 class IdaMcpPlugin(ida_idaapi.plugin_t):

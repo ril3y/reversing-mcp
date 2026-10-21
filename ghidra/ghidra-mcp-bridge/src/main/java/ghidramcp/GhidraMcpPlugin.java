@@ -1,6 +1,6 @@
 // Ghidra ProgramPlugin that auto-starts an HTTP MCP bridge when a program is
 // opened.  The bridge exposes a JSON-over-HTTP API so that Claude Code (via
-// the MCP server in mcp_server.py) can query and mutate the active program.
+// the unified reversing-mcp provider) can query and mutate the active program.
 //
 // Install: Drop this file into a Ghidra module's src/main/java tree, or
 //          compile it as a standalone extension.
@@ -25,6 +25,7 @@ import ghidra.framework.plugintool.PluginInfo;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.framework.plugintool.util.PluginStatus;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.*;
@@ -230,24 +231,28 @@ public class GhidraMcpPlugin extends ProgramPlugin {
 
             // Register endpoints
             server.createContext("/ping", wrap(this::handlePing));
+            server.createContext("/capabilities", wrap(this::handleCapabilities));
             server.createContext("/info", wrap(this::handleInfo));
             server.createContext("/segments", wrap(this::handleSegments));
             server.createContext("/decompile", wrap(this::handleDecompile));
             server.createContext("/disassemble", wrap(this::handleDisassemble));
             server.createContext("/function", wrap(this::handleFunction));
             server.createContext("/search_functions", wrap(this::handleSearchFunctions));
-            server.createContext("/rename", wrap(this::handleRename));
-            server.createContext("/comment", wrap(this::handleComment));
-            server.createContext("/set_segment_perms", wrap(this::handleSetSegmentPerms));
-            server.createContext("/analyze_range", wrap(this::handleAnalyzeRange));
-            server.createContext("/search_strings", wrap(this::handleSearchStrings));
             server.createContext("/xrefs_to", wrap(this::handleXrefsTo));
             server.createContext("/xrefs_from", wrap(this::handleXrefsFrom));
             server.createContext("/callers", wrap(this::handleCallers));
             server.createContext("/callees", wrap(this::handleCallees));
+            server.createContext("/search_strings", wrap(this::handleSearchStrings));
             server.createContext("/bytes", wrap(this::handleBytes));
+            server.createContext("/rename", wrap(this::handleRename));
+            server.createContext("/comment", wrap(this::handleComment));
+            server.createContext("/set_segment_perms", wrap(this::handleSetSegmentPerms));
+            server.createContext("/analyze_range", wrap(this::handleAnalyzeRange));
             server.createContext("/create_function", wrap(this::handleCreateFunction));
             server.createContext("/exec_script", wrap(this::handleExecScript));
+            server.createContext("/delete_function", wrap(this::handleDeleteFunction));
+            server.createContext("/save", wrap(this::handleSave));
+            server.createContext("/close", wrap(this::handleClose));
 
             server.start();
 
@@ -326,24 +331,18 @@ public class GhidraMcpPlugin extends ProgramPlugin {
                     "  \"pid\": " + pid + ",\n" +
                     "  \"port\": " + serverPort + ",\n" +
                     "  \"program\": \"" + escapeJson(name) + "\",\n" +
-                    "  \"program_path\": \"" + escapeJson(p.getExecutablePath()) + "\"\n" +
+                    "  \"program_path\": \"" + escapeJson(p.getExecutablePath()) + "\",\n" +
+                    "  \"session_id\": \"ghidra-" + pid + "\",\n" +
+                    "  \"provider_id\": \"ghidra\",\n" +
+                    "  \"protocol_version\": \"1.0\",\n" +
+                    "  \"mode\": \"gui\",\n" +
+                    "  \"owned\": false,\n" +
+                    "  \"read_only\": false\n" +
                     "}";
                 Path regFile = dir.resolve(pid + "_" + safeName + ".json");
                 Files.write(regFile, json.getBytes(StandardCharsets.UTF_8));
             }
 
-            // 3) Also keep a legacy <pid>.json pointing at the active program
-            //    (for any client that finds instances by exact filename pattern).
-            if (activeProgram != null) {
-                String json = "{\n" +
-                    "  \"pid\": " + pid + ",\n" +
-                    "  \"port\": " + serverPort + ",\n" +
-                    "  \"program\": \"" + escapeJson(currentProgram().getName()) + "\",\n" +
-                    "  \"program_path\": \"" + escapeJson(currentProgram().getExecutablePath()) + "\"\n" +
-                    "}";
-                Path regFile = dir.resolve(pid + ".json");
-                Files.write(regFile, json.getBytes(StandardCharsets.UTF_8));
-            }
         } catch (Exception e) {
             Msg.error(this, "[MCP] Registration failed", e);
         }
@@ -353,7 +352,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
         try {
             long pid = ProcessHandle.current().pid();
             Path dir = Paths.get(REGISTRATION_DIR);
-            // Delete legacy + all per-program registration files for this pid
+            // Delete all registration files owned by this plugin process.
             try (java.util.stream.Stream<Path> entries = Files.list(dir)) {
                 String prefix = pid + "_";
                 entries.filter(p -> {
@@ -689,6 +688,51 @@ public class GhidraMcpPlugin extends ProgramPlugin {
         respond(ex, json);
     }
 
+    private void handleCapabilities(HttpExchange ex) throws Exception {
+        String[] supported = {
+            "lifecycle.attach", "lifecycle.save", "target.info", "segments.list",
+            "functions.get", "functions.list", "analysis.disassemble",
+            "analysis.decompile", "analysis.xrefs", "callgraph.callers",
+            "callgraph.callees", "search.functions", "search.strings", "memory.read", "symbols.rename",
+            "comments.write", "functions.create", "functions.delete", "script.python"
+        };
+        List<String> values = new ArrayList<>();
+        for (String item : supported) {
+            values.add("\"" + escapeJson(item) + "\"");
+        }
+        respond(ex, "{" +
+            jp("protocol_version", "1.0") + ", " +
+            jp("provider_id", "ghidra") + ", " +
+            jp("mode", "gui") + ", " +
+            jp("owned", false) + ", " +
+            jp("read_only", false) + ", " +
+            "\"supported\":[" + String.join(",", values) + "], " +
+            "\"unsupported\":[" +
+            "{\"id\":\"lifecycle.close\",\"reason\":\"GUI sessions are user-owned.\"}" +
+            "]}");
+    }
+
+    private void handleSave(HttpExchange ex) throws Exception {
+        String json = onSwing(() -> {
+            Program program = currentProgram();
+            if (!program.canSave()) {
+                return "{" + jp("success", false) + ", " +
+                    jp("error", "program_not_savable") + "}";
+            }
+            program.save("MCP save", TaskMonitor.DUMMY);
+            return "{" + jp("success", true) + ", " +
+                jp("provider_id", "ghidra") + ", " +
+                jp("program", program.getName()) + "}";
+        });
+        respond(ex, json);
+    }
+
+    private void handleClose(HttpExchange ex) throws Exception {
+        respond(ex, "{" + jp("error", "unsupported_capability") + ", " +
+            jp("capability", "lifecycle.close") + ", " +
+            jp("reason", "GUI sessions are user-owned.") + "}", 409);
+    }
+
     // GET /info -----------------------------------------------------------
 
     private void handleInfo(HttpExchange ex) throws Exception {
@@ -807,22 +851,30 @@ public class GhidraMcpPlugin extends ProgramPlugin {
         Map<String, String> body = parseJsonBody(ex);
         String json = onSwing(() -> {
             Function func = resolveFunction(body);
-            if (func == null) {
-                return "{" + jp("error", "Function not found") + "}";
-            }
             Listing listing = currentProgram().getListing();
+            AddressSet range;
+            String name = "range";
+            if (func != null) {
+                range = new AddressSet(func.getBody());
+                name = func.getName();
+            } else {
+                Address start = parseAddress(body.get("start"));
+                Address end = parseAddress(body.get("end"));
+                if (start == null || end == null) {
+                    return "{" + jp("error", "Function or start/end range not found") + "}";
+                }
+                range = new AddressSet(start, end);
+            }
             StringBuilder sb = new StringBuilder();
             sb.append("{");
-            sb.append(jp("name", func.getName())).append(", ");
-            sb.append(jp("start",
-                formatAddr(func.getEntryPoint()))).append(", ");
-            sb.append(jp("end",
-                formatAddr(func.getBody().getMaxAddress()))).append(", ");
+            sb.append(jp("name", name)).append(", ");
+            sb.append(jp("start", formatAddr(range.getMinAddress()))).append(", ");
+            sb.append(jp("end", formatAddr(range.getMaxAddress()))).append(", ");
             sb.append("\"lines\": [");
 
             boolean first = true;
             InstructionIterator instrs =
-                listing.getInstructions(func.getBody(), true);
+                listing.getInstructions(range, true);
             while (instrs.hasNext()) {
                 Instruction instr = instrs.next();
                 if (!first) sb.append(", ");
@@ -908,6 +960,28 @@ public class GhidraMcpPlugin extends ProgramPlugin {
         respond(ex, json);
     }
 
+    private void handleDeleteFunction(HttpExchange ex) throws Exception {
+        Map<String, String> body = parseJsonBody(ex);
+        String json = onSwing(() -> {
+            Address address = parseAddress(body.get("address"));
+            if (address == null) return "{" + jp("error", "Invalid address") + "}";
+            Program program = currentProgram();
+            int transaction = program.startTransaction("MCP Delete Function");
+            boolean success = false;
+            try {
+                if (program.getListing().getFunctionAt(address) != null) {
+                    program.getListing().removeFunction(address);
+                    success = true;
+                }
+            } finally {
+                program.endTransaction(transaction, success);
+            }
+            return "{" + jp("success", success) + ", " +
+                jp("address", formatAddr(address)) + "}";
+        });
+        respond(ex, json);
+    }
+
     // POST /rename --------------------------------------------------------
 
     private void handleRename(HttpExchange ex) throws Exception {
@@ -975,6 +1049,7 @@ public class GhidraMcpPlugin extends ProgramPlugin {
         String addrStr = body.get("address");
         String comment = body.get("comment");
         String typeStr = body.get("type");
+        boolean repeatable = "true".equalsIgnoreCase(body.get("repeatable"));
 
         if (addrStr == null || addrStr.isEmpty()) {
             respondError(ex, "Provide 'address' and 'comment'", 400);
@@ -988,7 +1063,9 @@ public class GhidraMcpPlugin extends ProgramPlugin {
             }
 
             int commentType;
-            if ("plate".equalsIgnoreCase(typeStr)) {
+            if (repeatable) {
+                commentType = CodeUnit.REPEATABLE_COMMENT;
+            } else if ("plate".equalsIgnoreCase(typeStr)) {
                 commentType = CodeUnit.PLATE_COMMENT;
             } else {
                 commentType = CodeUnit.EOL_COMMENT;

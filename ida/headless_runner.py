@@ -7,9 +7,7 @@ Usage:
 
 What it does:
   1. Waits for IDA's auto-analysis to finish (ida_auto.auto_wait).
-  2. Loops with idc.sleep(100), which yields to IDA's internal event loop
-     every 100 ms.  This lets execute_sync calls from the MCP plugin's HTTP
-     handler thread run on the main thread without blocking the server.
+  2. Pumps the MCP request queue on IDA's main thread, then briefly sleeps.
   3. Exits cleanly on Ctrl+C or when IDA is asked to quit.
 
 The MCP plugin starts automatically via the normal plugin init path.
@@ -18,20 +16,49 @@ After this script prints "MCP server ready", use --scan or list_instances()
 from the MCP server on the other machine to find the port.
 """
 
+import importlib.util
+import os
+import sys
+import time
+
 import ida_auto
 import idc
 
+
+def _load_bridge():
+    """Load the installed plugin, falling back to the sibling source file."""
+    try:
+        import ida_mcp_plugin
+
+        return ida_mcp_plugin
+    except ImportError:
+        plugin_path = os.path.join(os.path.dirname(__file__), "plugin.py")
+        spec = importlib.util.spec_from_file_location("ida_mcp_plugin", plugin_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Cannot load IDA MCP plugin from {plugin_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+
+
 print("[MCP runner] Waiting for auto-analysis...")
 ida_auto.auto_wait()
+
+try:
+    bridge = _load_bridge()
+    bridge.start_server()
+except Exception as exc:
+    print(f"[MCP runner] Could not start bridge: {type(exc).__name__}: {exc}")
+    idc.qexit(1)
+    raise
+
 print("[MCP runner] Auto-analysis complete. MCP server ready.")
-print("[MCP runner] Press Ctrl+C or close this window to stop.")
+print("[MCP runner] Use close_session(save=True) for a clean shutdown.")
 
 try:
     while True:
-        # idc.sleep yields to IDA's internal event loop for N milliseconds,
-        # allowing execute_sync calls queued by the MCP plugin to fire on the
-        # main thread.  Do NOT use time.sleep here — that blocks the event loop
-        # and freezes MCP request handling.
-        idc.sleep(100)
+        bridge.drain_headless_requests()
+        time.sleep(0.05)
 except KeyboardInterrupt:
-    print("[MCP runner] Stopped.")
+    print("[MCP runner] Interrupted; leaving shutdown to IDA.")

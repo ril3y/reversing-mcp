@@ -28,9 +28,12 @@ def _pid_alive(pid: int) -> bool:
         return False
     if sys.platform == "win32":
         import ctypes
+
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+        )
         if not handle:
             return False
         kernel32.CloseHandle(handle)
@@ -66,8 +69,11 @@ def discover_instances(reg_dir: str) -> list[dict]:
     return instances
 
 
-def resolve_instance(reg_dir: str, target: str | None = None,
-                     name_keys: tuple[str, ...] = ("name", "path")) -> dict | None:
+def resolve_instance(
+    reg_dir: str,
+    target: str | None = None,
+    name_keys: tuple[str, ...] = ("name", "path"),
+) -> dict | None:
     """Find an instance, optionally matching by name substring."""
     instances = discover_instances(reg_dir)
     if not instances:
@@ -82,10 +88,15 @@ def resolve_instance(reg_dir: str, target: str | None = None,
     return instances[0]
 
 
-def call_instance(reg_dir: str, endpoint: str, body: dict | None = None,
-                  target: str | None = None, tool_name: str = "tool",
-                  name_keys: tuple[str, ...] = ("name", "path"),
-                  timeout: int = 30) -> dict:
+def call_instance(
+    reg_dir: str,
+    endpoint: str,
+    body: dict | None = None,
+    target: str | None = None,
+    tool_name: str = "tool",
+    name_keys: tuple[str, ...] = ("name", "path"),
+    timeout: int = 30,
+) -> dict:
     """HTTP call to a discovered instance. Returns JSON dict."""
     inst = resolve_instance(reg_dir, target, name_keys)
     if not inst:
@@ -93,7 +104,9 @@ def call_instance(reg_dir: str, endpoint: str, body: dict | None = None,
         if not available:
             return {"error": f"No {tool_name} instances found."}
         names = [i.get(name_keys[0], "?") for i in available]
-        return {"error": f"No {tool_name} instance matches '{target}'. Available: {names}"}
+        return {
+            "error": f"No {tool_name} instance matches '{target}'. Available: {names}"
+        }
 
     port = inst["port"]
     url = f"http://127.0.0.1:{port}{endpoint}"
@@ -116,8 +129,9 @@ def call_instance(reg_dir: str, endpoint: str, body: dict | None = None,
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-def call_remote(remote: str, endpoint: str, body: dict | None = None,
-                timeout: int = 30) -> dict:
+def call_remote(
+    remote: str, endpoint: str, body: dict | None = None, timeout: int = 30
+) -> dict:
     """HTTP call to an explicit remote host:port, bypassing local discovery."""
     host_port = remote if ":" in remote else f"{remote}:13337"
     url = f"http://{host_port}{endpoint}"
@@ -128,18 +142,22 @@ def call_remote(remote: str, endpoint: str, body: dict | None = None,
             r = httpx.get(url, timeout=timeout)
         return r.json()
     except httpx.ConnectError:
-        return {"error": f"Cannot connect to {host_port} — is the plugin running with IDA_MCP_BIND=0.0.0.0?"}
+        return {
+            "error": f"Cannot connect to {host_port}; is the provider bridge running?"
+        }
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-def list_instances_text(reg_dir: str, tool_name: str,
-                        name_key: str = "name") -> str:
+def list_instances_text(reg_dir: str, tool_name: str, name_key: str = "name") -> str:
     """Format instance list as human-readable text."""
     instances = discover_instances(reg_dir)
     if not instances:
         return f"No active {tool_name} instances."
     lines = []
     for inst in instances:
-        lines.append(f"  port:{inst['port']}  pid:{inst.get('pid','?')}  {name_key}:{inst.get(name_key,'?')}")
+        lines.append(
+            f"  port:{inst['port']}  pid:{inst.get('pid', '?')}  "
+            f"{name_key}:{inst.get(name_key, '?')}"
+        )
     return f"{len(instances)} active {tool_name} instance(s):\n" + "\n".join(lines)

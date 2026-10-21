@@ -1,87 +1,85 @@
-# frida MCP
+# Frida runtime notes
 
-Dynamic instrumentation. Unlike the other MCPs in this repo, there's no
-in-tool bridge to build — `frida-python` is the client library, and the
-MCP server uses it directly.
+Frida provides dynamic instrumentation for local processes and mobile targets.
+All client traffic enters through the repository's unified MCP server.
 
-## Setup
+## Host setup
 
-### Host (where Claude Code runs)
+Install the Python client libraries in the interpreter used by
+`python -m reversing_mcp`:
 
-```bash
-pip install frida frida-tools     # or: python install.py --tools frida
+```shell
+python -m pip install frida frida-tools
 ```
 
-That's it for the host. The MCP server connects to a Frida server running on
-whichever target you instrument.
+The installer can perform the same dependency step:
 
-### Target
+```shell
+python install.py --tools frida --scope user --clients claude
+```
 
-| Target               | Frida server                                                |
-|----------------------|-------------------------------------------------------------|
-| Local Windows/Mac/Linux | built into the host install — no extra setup            |
-| Android (rooted)     | `frida-server-<ver>-android-arm64` pushed to /data/local/tmp |
-| Android (non-rooted) | `frida-gadget` injected into the APK via `objection patchapk` or rebuild |
-| iOS (jailbroken)     | Cydia: `re.frida.server`                                    |
-| iOS (non-jailbroken) | `frida-gadget` embedded into a re-signed IPA                |
+## Target setup
 
-Quick Android-rooted recipe:
+| Target | Runtime requirement |
+|---|---|
+| Local Windows, macOS, or Linux | Included with the host installation |
+| Rooted Android | Matching `frida-server` in `/data/local/tmp` |
+| Non-rooted Android | `frida-gadget` embedded in a rebuilt APK |
+| Jailbroken iOS | `re.frida.server` package |
+| Non-jailbroken iOS | `frida-gadget` embedded in a re-signed IPA |
 
-```bash
-# On host:
+Example for a rooted Android device:
+
+```shell
 wget https://github.com/frida/frida/releases/download/<ver>/frida-server-<ver>-android-arm64.xz
 unxz frida-server-<ver>-android-arm64.xz
 adb push frida-server-<ver>-android-arm64 /data/local/tmp/frida-server
 adb shell "su -c 'chmod +x /data/local/tmp/frida-server && /data/local/tmp/frida-server &'"
-
-# Verify:
-frida-ps -U                       # should list device processes
+frida-ps -U
 ```
 
-## Tool surface
+Keep the host package and target server on compatible versions.
 
-The MCP exposes session-oriented tools. Typical flow:
+## Typical instrumentation lifecycle
 
-1. **`list_devices()`** — confirm host + device are reachable
-2. **`list_processes(device_id='usb')`** or **`list_applications`** — find the target
-3. **`attach(target, device_id)`** — returns `session_id` (or **`spawn(...)` → resume**)
-4. **`load_script(session_id, source)`** — inject your Frida JS, returns `script_id`
-5. **`drain_messages(script_id)`** — pull buffered `send(...)` payloads back
-6. **`call_rpc(script_id, 'methodName', [args...])`** — invoke `rpc.exports.methodName`
-7. **`detach(session_id)`** when done
+A Frida provider follows the shared session conventions:
 
-Convenience tools that skip the boilerplate JS:
+1. Discover devices and processes.
+2. Attach to or spawn an authorized target.
+3. Load JavaScript instrumentation.
+4. Drain buffered `send(...)` messages or call exported RPC methods.
+5. Detach cleanly.
 
-- `enum_modules(session_id)`
-- `enum_exports(session_id, module)`
-- `enum_imports(session_id, module)`
-- `find_export(session_id, module, symbol)`
-- `read_memory(session_id, address, size)`
+Provider-specific actions should remain namespaced operations behind the
+unified `invoke` tool. They should not create a second MCP surface.
 
-## Cookbook: dumping `RegisterNatives` arguments
+## Example: observe `RegisterNatives`
 
-The motivating use case for this MCP — finding which Java methods are
-wired to which native function pointers inside an obfuscated JNI_OnLoad:
+This script records Java method names, signatures, and native function pointers
+registered by an Android runtime. Pass it to the provider's script-loading
+operation and drain the resulting `send(...)` messages.
 
 ```javascript
-// Pass this string as `source` to load_script.
-const RegisterNatives = Module.findExportByName('libart.so', '_ZN3art3JNI15RegisterNativesEP7_JNIEnvP7_jclassPK15JNINativeMethodi');
-Interceptor.attach(RegisterNatives, {
+const registerNatives = Module.findExportByName(
+  "libart.so",
+  "_ZN3art3JNI15RegisterNativesEP7_JNIEnvP7_jclassPK15JNINativeMethodi"
+);
+
+Interceptor.attach(registerNatives, {
   onEnter(args) {
-    const env = args[0];
-    const cls = args[1];
-    const methods = args[2];     // const JNINativeMethod*
+    const methods = args[2];
     const count = args[3].toInt32();
     for (let i = 0; i < count; i++) {
-      const m = methods.add(i * 24);    // {name*, sig*, fnPtr*} = 24 bytes
+      const method = methods.add(i * 24);
       send({
-        name: m.readPointer().readCString(),
-        sig: m.add(8).readPointer().readCString(),
-        fnPtr: m.add(16).readPointer().toString(),
+        name: method.readPointer().readCString(),
+        signature: method.add(8).readPointer().readCString(),
+        function: method.add(16).readPointer().toString(),
       });
     }
   },
 });
 ```
 
-Then `drain_messages(script_id)` to pull the table.
+Only instrument software and devices you are authorized to inspect. Frida
+scripts execute inside the target process and can change its behavior.

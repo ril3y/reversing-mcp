@@ -13,10 +13,24 @@ from pathlib import Path
 
 # Stub every IDA module plugin.py touches at import time.
 _IDA_STUB_MODULES = [
-    "ida_auto", "ida_bytes", "ida_dbg", "ida_funcs", "ida_hexrays",
-    "ida_ida", "ida_idaapi", "ida_idd", "ida_kernwin", "ida_netnode",
-    "ida_lines", "ida_name", "ida_nalt", "ida_segment", "ida_typeinf",
-    "ida_xref", "idautils", "idc",
+    "ida_auto",
+    "ida_bytes",
+    "ida_dbg",
+    "ida_funcs",
+    "ida_hexrays",
+    "ida_ida",
+    "ida_idaapi",
+    "ida_idd",
+    "ida_kernwin",
+    "ida_netnode",
+    "ida_lines",
+    "ida_name",
+    "ida_nalt",
+    "ida_segment",
+    "ida_typeinf",
+    "ida_xref",
+    "idautils",
+    "idc",
 ]
 for name in _IDA_STUB_MODULES:
     sys.modules.setdefault(name, types.ModuleType(name))
@@ -29,7 +43,9 @@ sys.modules["ida_kernwin"].msg = lambda *a, **k: None
 sys.modules["ida_idaapi"].plugin_t = type("plugin_t", (object,), {})
 sys.modules["ida_idaapi"].PLUGIN_KEEP = 0
 sys.modules["ida_idaapi"].BADADDR = -1
-sys.modules["ida_dbg"].DBG_Hooks = type("DBG_Hooks", (object,), {"hook": lambda self: None})
+sys.modules["ida_dbg"].DBG_Hooks = type(
+    "DBG_Hooks", (object,), {"hook": lambda self: None}
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ida"))
 import plugin  # noqa: E402
@@ -78,8 +94,9 @@ def main():
     # code-fence content survives
     assert "WinUsb_WritePipe" in html
     # tables are the whole point of this test: must render as <table>
-    assert "<table>" in html and "<th>" in html and "<td>" in html, \
+    assert "<table>" in html and "<th>" in html and "<td>" in html, (
         "table not rendered — markdown 'extra' / 'tables' extension missing"
+    )
     # the install-fallback page should NOT have fired
     assert "Markdown renderer not available" not in html
     print("OK — render produced", len(html), "chars (table rendered)")
