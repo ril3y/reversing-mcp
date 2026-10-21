@@ -173,6 +173,7 @@ def test_all_provider_families_are_registered_without_native_sdks():
     assert {backend.provider_id for backend in builtin_backends()} == {
         "binary_ninja",
         "bluetooth_le",
+        "capstone",
         "frida",
         "ghidra",
         "ida",

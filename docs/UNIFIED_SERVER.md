@@ -76,6 +76,11 @@ the unified server or other providers from starting.
   `ILSPY_MCP_BRIDGE` path.
 - Bluetooth LE requires `bleak` in the registered Python environment. Install
   it with `python install.py --tools ble --scope user --clients claude,codex`.
+- Capstone requires `capstone` in the registered Python environment. Install
+  it with
+  `python install.py --tools capstone --scope user --clients claude,codex`.
+  It provides read-only raw-byte and file-region disassembly without an
+  analysis database; see [Capstone raw disassembly](CAPSTONE.md).
 - The `protocol` provider has no external dependency or target requirement.
 
 IDA, Ghidra, JADX, and ILSpy still require their corresponding native bridge

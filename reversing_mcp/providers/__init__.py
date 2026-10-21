@@ -5,6 +5,7 @@ from __future__ import annotations
 from ..backends import AnalysisBackend
 from .binary_ninja import BinaryNinjaBackend
 from .bluetooth_le import BluetoothLeBackend
+from .capstone import CapstoneBackend
 from .frida import FridaBackend
 from .ilspy import IlspyBackend
 from .local_bridges import GhidraBackend, IdaBackend, JadxBackend
@@ -17,6 +18,7 @@ def builtin_backends() -> tuple[AnalysisBackend, ...]:
     return (
         BinaryNinjaBackend(),
         BluetoothLeBackend(),
+        CapstoneBackend(),
         FridaBackend(),
         GhidraBackend(),
         IdaBackend(),

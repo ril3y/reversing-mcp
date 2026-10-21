@@ -114,6 +114,30 @@ def test_run_install_registers_unified_once_per_client(monkeypatch):
     assert registrations == ["claude", "codex"]
 
 
+def test_capstone_installer_uses_registered_python(monkeypatch):
+    commands = []
+    monkeypatch.setattr(install.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(
+        install, "_run", lambda command, **_kwargs: commands.append(command) or 0
+    )
+
+    result = install.build_capstone(context(skip_builds=False))
+
+    assert result.ok
+    assert commands == [
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--only-binary=:all:",
+            "capstone",
+        ]
+    ]
+    tool = next(item for item in install.TOOLS if item.key == "capstone")
+    assert tool.present()
+
+
 def test_removed_registration_selector_is_rejected(monkeypatch):
     monkeypatch.setattr(
         sys,

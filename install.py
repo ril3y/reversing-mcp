@@ -12,6 +12,7 @@ Walks the user through:
        - jadx   → gradle shadowJar (needs JDK 17+)
        - ilspy  → dotnet publish -c Release (needs .NET 8 SDK)
        - ble    → install the optional Bleak transport
+       - capstone → install the optional raw-byte disassembly engine
   4. Registering the unified server with Claude Code and/or Codex.
 
 Non-interactive mode for CI:
@@ -551,6 +552,38 @@ def deploy_bluetooth_le(ctx: Context) -> Result:
     )
 
 
+# ---- Capstone ----
+
+
+def build_capstone(ctx: Context) -> Result:
+    if ctx.skip_builds:
+        return Result(True, "(skipped per --skip-builds)")
+    command = [sys.executable, "-m", "pip", "install"]
+    if platform.system() == "Windows":
+        # Windows ARM64 has no stable Capstone 5 wheel for Python 3.13. Avoid
+        # an accidental native build that requires Visual Studio/nmake; pip
+        # can select Capstone's compatible abi3 wheel instead.
+        command.append("--only-binary=:all:")
+    command.append("capstone")
+    rc = _run(command, dry=ctx.dry_run)
+    if rc != 0:
+        return Result(False, f"pip install capstone exited {rc}")
+    return Result(
+        True,
+        "Capstone installed",
+        note="The capstone provider decodes raw bytes and file regions headlessly.",
+    )
+
+
+def deploy_capstone(ctx: Context) -> Result:
+    del ctx
+    return Result(
+        True,
+        "no deploy step",
+        note="Capstone runs in-process through the unified Python provider.",
+    )
+
+
 # ---- Registry ----
 
 TOOLS: list[Tool] = [
@@ -605,6 +638,15 @@ TOOLS: list[Tool] = [
         "reversing_mcp/providers/bluetooth_le.py",
         build_bluetooth_le,
         deploy_bluetooth_le,
+    ),
+    Tool(
+        "capstone",
+        "Capstone",
+        "Read-only raw-byte and file-region disassembly for ARM, x86, and "
+        "other supported architectures.",
+        "reversing_mcp/providers/capstone.py",
+        build_capstone,
+        deploy_capstone,
     ),
 ]
 

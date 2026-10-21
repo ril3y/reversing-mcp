@@ -1,7 +1,7 @@
 # reversing-mcp
 
 One MCP server for reverse engineering with IDA Pro, Ghidra, JADX, ILSpy,
-Binary Ninja, radare2, Frida, Bluetooth LE, and offline protocol utilities. It
+Binary Ninja, radare2, Capstone, Frida, Bluetooth LE, and offline protocol utilities. It
 provides stable session IDs, a common
 capability model, persistent database lifecycle, headless operation, and
 guarded provider-native script execution.
@@ -22,6 +22,7 @@ SessionManager + provider registry
         +-- ILSpy adapter ------> owned .NET bridge
         +-- Binary Ninja -------> Python API
         +-- radare2 ------------> r2pipe
+        +-- Capstone -----------> in-process raw-byte disassembly
         +-- Frida adapter ------> local/USB/remote Frida device
         +-- Bluetooth LE -------> Bleak and the host Bluetooth adapter
         `-- Protocol -----------> checksum, Modbus, and register-map helpers
@@ -236,6 +237,21 @@ python -m pip install r2pipe
 The adapter opens targets headlessly and persists state through radare2
 projects. Project names are validated before being passed to radare2.
 
+### Capstone
+
+Install the optional Capstone engine into the Python interpreter registered
+with the clients:
+
+```shell
+python install.py --tools capstone --scope user --clients claude,codex
+```
+
+The `capstone` provider decodes raw bytes or bounded file regions without a GUI
+or analysis database. It supports explicit architecture, mode, endianness,
+base address, and file offset settings, including ARM Cortex-M Thumb images.
+It intentionally does not advertise function discovery, xrefs, decompilation,
+annotations, or persistence. See [Capstone raw disassembly](docs/CAPSTONE.md).
+
 ## Script execution
 
 Provider-native scripts are disabled by default. Enable them only for trusted
@@ -267,6 +283,7 @@ reversing_mcp/
 |-- registry.py            Provider registration
 |-- manager.py             Lifecycle, policy, persistence, and dispatch
 |-- android_artifacts.py   Nested APK/XAPK and bundled JavaScript analysis
+|-- capstone_engine.py     Architecture/mode normalization and decoding
 |-- protocols.py           Checksums, Modbus RTU, and register maps
 |-- server.py              Unified FastMCP surface
 `-- providers/
@@ -275,6 +292,7 @@ reversing_mcp/
     |-- frida.py           Frida dynamic instrumentation adapter
     |-- binary_ninja.py    Binary Ninja adapter
     |-- bluetooth_le.py    Bleak transport and transcript capture
+    |-- capstone.py        Lightweight raw-byte disassembly provider
     |-- protocol.py        Offline protocol-analysis provider
     `-- radare2.py         radare2 adapter
 ```
