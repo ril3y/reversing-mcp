@@ -28,8 +28,9 @@ SessionManager -> AnalysisBackend -> AnalysisSession
 ```
 
 The currently registered built-ins are IDA, Ghidra, JADX, ILSpy, Binary Ninja,
-radare2, and Frida. Optional SDKs are imported lazily so one unavailable engine
-does not prevent the server from starting.
+radare2, Capstone, Frida, Bluetooth LE, and offline protocol utilities.
+Optional SDKs are imported lazily so one unavailable engine does not prevent
+the server from starting.
 
 ## Core package
 
@@ -40,6 +41,8 @@ does not prevent the server from starting.
 - `reversing_mcp/registry.py`: provider registry and built-in registration.
 - `reversing_mcp/manager.py`: stable session IDs, lifecycle validation,
   per-session serialization, script policy, dispatch, and mutation autosave.
+- `reversing_mcp/capstone_engine.py`: Capstone architecture/mode normalization
+  and provider-independent instruction decoding.
 - `reversing_mcp/server.py`: the only FastMCP surface.
 - `reversing_mcp/providers/`: provider adapters.
 
@@ -208,13 +211,18 @@ guarded script route. Track every script, message queue, native session, and
 spawned PID inside the owning session so close can unload/detach and optionally
 kill only the process it created.
 
-## Binary Ninja and radare2
+## Binary Ninja, radare2, and Capstone
 
 These providers use Python APIs directly and import optional dependencies only
 when opened. Do not import `binaryninja` or `r2pipe` at unified-server startup.
 Both SDKs are stateful; keep provider calls serialized. Binary Ninja persists
 `.bndb` files. radare2 persists projects and must validate project names before
 constructing commands.
+
+Capstone is a read-only, stateless decoder with a lazy optional import. Keep
+architecture, instruction mode, endianness, base address, and file offset
+explicit in results. It must not advertise analysis-database features such as
+function discovery, xrefs, comments, types, or saving.
 
 ## Installer
 
@@ -239,8 +247,9 @@ python -m ruff check .
 python -m pytest -q
 ```
 
-Unit tests should not require IDA, Ghidra, JADX, ILSpy, Binary Ninja, radare2,
-or Frida. Use fake bridges and fake SDK modules. Every persistent provider
+Unit tests should not require IDA, Ghidra, JADX, ILSpy, Binary Ninja, Capstone,
+radare2, or Frida. Use fake bridges, fake SDK modules, or skip an optional
+engine-specific decoding assertion. Every persistent provider
 needs a round-trip test:
 
 1. Create a database from a fixture artifact.
