@@ -11,6 +11,7 @@ Walks the user through:
                   extract it into the user Extensions dir
        - jadx   → gradle shadowJar (needs JDK 17+)
        - ilspy  → dotnet publish -c Release (needs .NET 8 SDK)
+       - ble    → install the optional Bleak transport
   4. Registering the unified server with Claude Code and/or Codex.
 
 Non-interactive mode for CI:
@@ -525,6 +526,31 @@ def deploy_frida(ctx: Context) -> Result:
     )
 
 
+# ---- Bluetooth LE ----
+
+
+def build_bluetooth_le(ctx: Context) -> Result:
+    if ctx.skip_builds:
+        return Result(True, "(skipped per --skip-builds)")
+    rc = _run([sys.executable, "-m", "pip", "install", "bleak"], dry=ctx.dry_run)
+    if rc != 0:
+        return Result(False, f"pip install bleak exited {rc}")
+    return Result(
+        True,
+        "Bleak installed",
+        note="The bluetooth_le provider uses the host Bluetooth adapter.",
+    )
+
+
+def deploy_bluetooth_le(ctx: Context) -> Result:
+    del ctx
+    return Result(
+        True,
+        "no deploy step",
+        note="BLE scan/connect/capture runs through the unified Python provider.",
+    )
+
+
 # ---- Registry ----
 
 TOOLS: list[Tool] = [
@@ -571,6 +597,14 @@ TOOLS: list[Tool] = [
         "reversing_mcp/providers/frida.py",
         build_frida,
         deploy_frida,
+    ),
+    Tool(
+        "ble",
+        "Bluetooth LE",
+        "Scan, connect, inspect GATT, exchange frames, and save transcripts.",
+        "reversing_mcp/providers/bluetooth_le.py",
+        build_bluetooth_le,
+        deploy_bluetooth_le,
     ),
 ]
 
@@ -623,6 +657,17 @@ def _remove_existing_mcp(client: str, name: str, scope: str, *, dry: bool) -> No
     )
 
 
+def local_jadx_bridge() -> Path:
+    return (
+        REPO_ROOT
+        / "jadx"
+        / "jadx-mcp-bridge"
+        / "build"
+        / "libs"
+        / "jadx-mcp-bridge.jar"
+    )
+
+
 def register_unified_mcp(client: str, ctx: Context) -> Result:
     prefix, error = _registration_prefix(client, ctx.scope)
     if error:
@@ -637,6 +682,9 @@ def register_unified_mcp(client: str, ctx: Context) -> Result:
         if path and path not in python_paths
     )
     environment = {"PYTHONPATH": os.pathsep.join(python_paths)}
+    jadx_bridge = local_jadx_bridge()
+    if jadx_bridge.is_file():
+        environment["JADX_MCP_BRIDGE_JAR"] = str(jadx_bridge)
     if ctx.allow_scripts:
         environment["REVERSING_MCP_ALLOW_SCRIPTS"] = "1"
     if ctx.script_providers:

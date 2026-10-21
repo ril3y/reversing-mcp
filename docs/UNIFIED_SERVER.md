@@ -74,6 +74,9 @@ the unified server or other providers from starting.
 - ILSpy requires the published .NET bridge under
   `ilspy/IlspyMcpBridge/bin/Release/net8.0/publish`, or an explicit
   `ILSPY_MCP_BRIDGE` path.
+- Bluetooth LE requires `bleak` in the registered Python environment. Install
+  it with `python install.py --tools ble --scope user --clients claude,codex`.
+- The `protocol` provider has no external dependency or target requirement.
 
 IDA, Ghidra, JADX, and ILSpy still require their corresponding native bridge
 or plugin setup. The unified protocol owns and drives those components; it
@@ -136,3 +139,7 @@ Read-only providers advertise only real lifecycle behavior. ILSpy opens or
 attaches to an assembly bridge and closes owned processes without a fake save
 operation. Frida opens an inventory/spawn session or attaches to a process,
 then detaches on close; it likewise has no database save capability.
+JADX keeps archive and JavaScript operations read-only and removes its owned
+temporary XAPK extraction when the session closes. Bluetooth sessions own a
+live connection but never claim database persistence; transcript files are
+written only by an explicit `ble.transcript.save` operation.
