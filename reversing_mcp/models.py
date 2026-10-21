@@ -89,6 +89,14 @@ class CommonOperation(StrEnum):
     NOTEBOOK_APPEND = "notebook.append"
     NOTEBOOK_REPLACE = "notebook.replace"
     NOTEBOOK_CLEAR = "notebook.clear"
+    ARTIFACT_ENTRIES_LIST = "artifact.entries.list"
+    ARTIFACT_FILES_EXTRACT = "artifact.files.extract"
+    SOURCE_SEARCH = "source.search"
+    SOURCE_PRETTY = "source.pretty"
+    PROTOCOL_CHECKSUM_DETECT = "protocol.checksum.detect"
+    PROTOCOL_CHECKSUM_VERIFY = "protocol.checksum.verify"
+    PROTOCOL_MODBUS_DECODE = "protocol.modbus.decode"
+    PROTOCOL_REGISTERS_DECODE = "protocol.registers.decode"
 
 
 @dataclass(frozen=True, slots=True)

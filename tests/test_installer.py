@@ -43,6 +43,24 @@ def test_claude_registration_uses_only_unified_module(monkeypatch):
     assert not any(part.endswith("mcp_server.py") for part in command)
 
 
+def test_registration_includes_built_jadx_bridge(tmp_path, monkeypatch):
+    commands = []
+    bridge = tmp_path / "jadx-mcp-bridge.jar"
+    bridge.write_bytes(b"jar")
+    monkeypatch.setattr(install, "client_exists", lambda _client: True)
+    monkeypatch.setattr(install, "_remove_existing_mcp", lambda *_a, **_kw: None)
+    monkeypatch.setattr(install, "local_jadx_bridge", lambda: bridge)
+    monkeypatch.setattr(
+        install, "_run", lambda command, **_kwargs: commands.append(command) or 0
+    )
+
+    result = install.register_unified_mcp("codex", context(clients=("codex",)))
+
+    assert result.ok
+    server_index = commands[0].index("reversing-mcp")
+    assert f"JADX_MCP_BRIDGE_JAR={bridge}" in commands[0][:server_index]
+
+
 def test_codex_registration_sets_script_policy_before_server_name(monkeypatch):
     commands = []
     monkeypatch.setattr(install, "client_exists", lambda _client: True)

@@ -172,11 +172,13 @@ def test_radare2_rejects_unsafe_project_name():
 def test_all_provider_families_are_registered_without_native_sdks():
     assert {backend.provider_id for backend in builtin_backends()} == {
         "binary_ninja",
+        "bluetooth_le",
         "frida",
         "ghidra",
         "ida",
         "ilspy",
         "jadx",
+        "protocol",
         "radare2",
     }
 

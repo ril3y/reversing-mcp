@@ -12,6 +12,7 @@ from typing import Any, Mapping
 
 from common import call_remote, discover_instances
 
+from ..android_artifacts import AndroidArtifact
 from ..backends import AnalysisBackend, AnalysisSession
 from ..errors import ReversingMcpError
 from ..models import (
@@ -211,6 +212,16 @@ JADX_OPERATIONS = (
     OperationSpec("android.classes.list", "android.classes.list"),
     OperationSpec("android.classes.get", "android.classes.get"),
     OperationSpec("android.resources.list", "android.resources.list"),
+    OperationSpec(CommonOperation.ARTIFACT_ENTRIES_LIST, "artifact.entries.list"),
+    OperationSpec(
+        CommonOperation.ARTIFACT_FILES_EXTRACT,
+        "artifact.files.extract",
+        mutating=True,
+    ),
+    OperationSpec(CommonOperation.SOURCE_SEARCH, "source.search"),
+    OperationSpec(CommonOperation.SOURCE_PRETTY, "source.pretty"),
+    OperationSpec("android.framework.detect", "android.framework.detect"),
+    OperationSpec("android.uniapp.inspect", "android.uniapp.inspect"),
 )
 
 JADX_CAPABILITIES = frozenset(
@@ -228,6 +239,23 @@ JADX_CAPABILITIES = frozenset(
         "android.classes.get",
         "android.methods.list",
         "android.resources.list",
+        "artifact.entries.list",
+        "artifact.files.extract",
+        "source.search",
+        "source.pretty",
+        "android.framework.detect",
+        "android.uniapp.inspect",
+    }
+)
+
+JADX_ARTIFACT_CAPABILITIES = frozenset(
+    {
+        "artifact.entries.list",
+        "artifact.files.extract",
+        "source.search",
+        "source.pretty",
+        "android.framework.detect",
+        "android.uniapp.inspect",
     }
 )
 
@@ -747,10 +775,66 @@ _JADX_ENDPOINTS = {
 
 
 class JadxSession(LocalBridgeSession):
+    def __init__(
+        self, *args, artifact: AndroidArtifact | None = None, **kwargs
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._artifact = artifact
+
+    def _require_artifact(self) -> AndroidArtifact:
+        if self._artifact is None:
+            raise ReversingMcpError(
+                "unsupported_capability",
+                "Artifact operations require an APK, XAPK, APKS, or ZIP target",
+            )
+        return self._artifact
+
+    async def invoke(self, operation: str, arguments: Mapping[str, Any]) -> Any:
+        artifact_routes = {
+            CommonOperation.ARTIFACT_ENTRIES_LIST: "list_entries",
+            CommonOperation.ARTIFACT_FILES_EXTRACT: "extract",
+            CommonOperation.SOURCE_SEARCH: "javascript_search",
+            CommonOperation.SOURCE_PRETTY: "javascript_source",
+        }
+        route = artifact_routes.get(operation)
+        if route:
+            artifact = self._require_artifact()
+            return await asyncio.to_thread(getattr(artifact, route), arguments)
+        if operation in {"android.framework.detect", "android.uniapp.inspect"}:
+            artifact = self._require_artifact()
+            result = await asyncio.to_thread(artifact.dcloud_inspect)
+            try:
+                classes = await super().invoke(
+                    CommonOperation.SEARCH_CLASSES,
+                    {"query": "io.dcloud", "limit": 25},
+                )
+            except ReversingMcpError as error:
+                result["class_detection"] = {
+                    "available": False,
+                    "reason": error.message,
+                }
+            else:
+                candidates = (
+                    classes.get("classes", []) if isinstance(classes, dict) else []
+                )
+                result["class_detection"] = {
+                    "available": True,
+                    "matches": candidates,
+                }
+                if candidates:
+                    result["detected"] = True
+                    result["framework"] = "uni-app/dcloud"
+            return result
+        return await super().invoke(operation, arguments)
+
     async def close(self, *, save: bool = True) -> Any:
         """Close the owned read-only JVM without implying a save operation."""
         del save
-        return await super().close(save=False)
+        try:
+            return await super().close(save=False)
+        finally:
+            if self._artifact is not None:
+                await asyncio.to_thread(self._artifact.close)
 
     @staticmethod
     def _translate(operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -780,6 +864,7 @@ class JadxBackend(AnalysisBackend):
 
     async def open(self, request: SessionRequest) -> AnalysisSession:
         reg_dir = os.path.expanduser("~/.jadx_mcp")
+        artifact: AndroidArtifact | None = None
         if request.lifecycle == LifecycleAction.ATTACH:
             registration = await asyncio.to_thread(
                 _attach_registration, reg_dir, request.target_path
@@ -789,17 +874,28 @@ class JadxBackend(AnalysisBackend):
             from jadx.session import start_bridge
 
             options = dict(request.options)
-            result = await asyncio.to_thread(
-                start_bridge,
-                request.target_path,
-                bridge_jar=str(options.get("bridge_jar", "")),
-                java_command=str(options.get("java_command", "java")),
-                timeout=float(options.get("timeout", 120)),
-                registrations=lambda: discover_instances(reg_dir),
-            )
-            registration = _error_response("jadx", result)
+            target = request.target_path
+            if Path(target).suffix.lower() in {".apk", ".xapk", ".apks", ".zip"}:
+                artifact = AndroidArtifact(target)
+                target = str(await asyncio.to_thread(artifact.primary_apk))
+            try:
+                result = await asyncio.to_thread(
+                    start_bridge,
+                    target,
+                    bridge_jar=str(options.get("bridge_jar", "")),
+                    java_command=str(options.get("java_command", "java")),
+                    timeout=float(options.get("timeout", 120)),
+                    registrations=lambda: discover_instances(reg_dir),
+                )
+                registration = _error_response("jadx", result)
+            except Exception:
+                if artifact is not None:
+                    artifact.close()
+                raise
             owned = True
         session_capabilities = set(JADX_CAPABILITIES)
+        if artifact is None:
+            session_capabilities -= JADX_ARTIFACT_CAPABILITIES
         if not owned and not registration.get("owned", False):
             session_capabilities.discard(Capability.LIFECYCLE_CLOSE)
         return JadxSession(
@@ -812,4 +908,5 @@ class JadxBackend(AnalysisBackend):
             endpoint_map=_JADX_ENDPOINTS,
             owned=owned or bool(registration.get("owned", False)),
             read_only=True,
+            artifact=artifact,
         )

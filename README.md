@@ -1,7 +1,8 @@
 # reversing-mcp
 
 One MCP server for reverse engineering with IDA Pro, Ghidra, JADX, ILSpy,
-Binary Ninja, radare2, and Frida. It provides stable session IDs, a common
+Binary Ninja, radare2, Frida, Bluetooth LE, and offline protocol utilities. It
+provides stable session IDs, a common
 capability model, persistent database lifecycle, headless operation, and
 guarded provider-native script execution.
 
@@ -21,7 +22,9 @@ SessionManager + provider registry
         +-- ILSpy adapter ------> owned .NET bridge
         +-- Binary Ninja -------> Python API
         +-- radare2 ------------> r2pipe
-        `-- Frida adapter ------> local/USB/remote Frida device
+        +-- Frida adapter ------> local/USB/remote Frida device
+        +-- Bluetooth LE -------> Bleak and the host Bluetooth adapter
+        `-- Protocol -----------> checksum, Modbus, and register-map helpers
 ```
 
 The native bridges remain provider-specific, but clients register only the
@@ -161,10 +164,28 @@ cd jadx/jadx-mcp-bridge
 gradle shadowJar
 ```
 
-The unified provider starts an owned JVM per APK, AAB, JAR, or DEX. Set
+The unified provider starts an owned JVM per APK, XAPK, AAB, JAR, or DEX. Set
 `JADX_MCP_BRIDGE_JAR` when the artifact is not in the default Gradle output
-directory. JADX sessions are intentionally read-only. See [JADX provider
-notes](jadx/PROVIDER.md).
+directory. For APK/XAPK inputs the same session can inventory and extract nested
+members, search bundled JavaScript with context, pretty-print a selected module
+or function, and identify DCloud/uni-app apps, pages, and modules. Temporary
+extractions are removed when the session closes. JADX sessions are intentionally
+read-only. See [JADX provider notes](jadx/PROVIDER.md).
+
+### Bluetooth LE and protocol analysis
+
+Install the optional Bleak transport into the registered Python environment:
+
+```shell
+python install.py --tools ble --scope user --clients claude,codex
+```
+
+Open a `bluetooth_le` session with an optional device address. Its operations
+cover scanning, connecting, service/characteristic inventory, reads, writes,
+notifications, and timestamped JSON/JSONL transcripts. The same session exposes
+checksum, Modbus RTU, and register-map decoding operations. An offline
+`protocol` session exposes those protocol operations without Bluetooth or a
+target file. See [Android, JavaScript, BLE, and protocol tools](docs/ANDROID_BLE.md).
 
 ### ILSpy
 
@@ -245,12 +266,16 @@ reversing_mcp/
 |-- backends.py            AnalysisBackend and AnalysisSession interfaces
 |-- registry.py            Provider registration
 |-- manager.py             Lifecycle, policy, persistence, and dispatch
+|-- android_artifacts.py   Nested APK/XAPK and bundled JavaScript analysis
+|-- protocols.py           Checksums, Modbus RTU, and register maps
 |-- server.py              Unified FastMCP surface
 `-- providers/
     |-- local_bridges.py   IDA, Ghidra, and JADX adapters
     |-- ilspy.py           ILSpy read-only bridge adapter
     |-- frida.py           Frida dynamic instrumentation adapter
     |-- binary_ninja.py    Binary Ninja adapter
+    |-- bluetooth_le.py    Bleak transport and transcript capture
+    |-- protocol.py        Offline protocol-analysis provider
     `-- radare2.py         radare2 adapter
 ```
 
