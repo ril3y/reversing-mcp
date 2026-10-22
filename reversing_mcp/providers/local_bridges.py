@@ -785,7 +785,7 @@ class JadxSession(LocalBridgeSession):
         if self._artifact is None:
             raise ReversingMcpError(
                 "unsupported_capability",
-                "Artifact operations require an APK, XAPK, APKS, or ZIP target",
+                "Artifact operations require an APK, XAPK, APKS, AAB, or ZIP target",
             )
         return self._artifact
 
@@ -800,7 +800,10 @@ class JadxSession(LocalBridgeSession):
         if route:
             artifact = self._require_artifact()
             return await asyncio.to_thread(getattr(artifact, route), arguments)
-        if operation in {"android.framework.detect", "android.uniapp.inspect"}:
+        if operation == "android.framework.detect":
+            artifact = self._require_artifact()
+            return await asyncio.to_thread(artifact.frameworks_detect)
+        if operation == "android.uniapp.inspect":
             artifact = self._require_artifact()
             result = await asyncio.to_thread(artifact.dcloud_inspect)
             try:
@@ -875,9 +878,11 @@ class JadxBackend(AnalysisBackend):
 
             options = dict(request.options)
             target = request.target_path
-            if Path(target).suffix.lower() in {".apk", ".xapk", ".apks", ".zip"}:
+            artifact_suffix = Path(target).suffix.lower()
+            if artifact_suffix in {".apk", ".xapk", ".apks", ".aab", ".zip"}:
                 artifact = AndroidArtifact(target)
-                target = str(await asyncio.to_thread(artifact.primary_apk))
+                if artifact_suffix != ".aab":
+                    target = str(await asyncio.to_thread(artifact.primary_apk))
             try:
                 result = await asyncio.to_thread(
                     start_bridge,

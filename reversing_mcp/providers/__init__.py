@@ -7,6 +7,7 @@ from .binary_ninja import BinaryNinjaBackend
 from .bluetooth_le import BluetoothLeBackend
 from .capstone import CapstoneBackend
 from .frida import FridaBackend
+from .flutter import FlutterBackend
 from .ilspy import IlspyBackend
 from .local_bridges import GhidraBackend, IdaBackend, JadxBackend
 from .protocol import ProtocolBackend
@@ -20,6 +21,7 @@ def builtin_backends() -> tuple[AnalysisBackend, ...]:
         BluetoothLeBackend(),
         CapstoneBackend(),
         FridaBackend(),
+        FlutterBackend(),
         GhidraBackend(),
         IdaBackend(),
         IlspyBackend(),

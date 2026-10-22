@@ -78,6 +78,9 @@ def test_xapk_nested_search_pretty_dcloud_and_extract(tmp_path):
         assert "pages/index/index" in dcloud["apps"][0]["pages"]
         assert "pages/settings/settings" in dcloud["apps"][0]["pages"]
 
+        frameworks = artifact.frameworks_detect()
+        assert frameworks["frameworks"] == ["uni-app/dcloud"]
+
         result = artifact.extract({"path": "base.apk!/assets/apps/H123/www/pages.json"})
         extracted = result["files"][0]
         assert result["temporary"] is True

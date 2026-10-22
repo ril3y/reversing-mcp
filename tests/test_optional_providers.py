@@ -175,6 +175,7 @@ def test_all_provider_families_are_registered_without_native_sdks():
         "bluetooth_le",
         "capstone",
         "frida",
+        "flutter",
         "ghidra",
         "ida",
         "ilspy",

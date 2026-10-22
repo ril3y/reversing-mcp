@@ -18,7 +18,7 @@ from typing import Any, Iterator, Mapping
 
 from .errors import ReversingMcpError
 
-_ARCHIVE_SUFFIXES = {".apk", ".xapk", ".zip", ".apks"}
+_ARCHIVE_SUFFIXES = {".apk", ".xapk", ".zip", ".apks", ".aab"}
 _JAVASCRIPT_SUFFIXES = {".js", ".mjs", ".cjs"}
 _MAX_MEMBER_BYTES = 64 * 1024 * 1024
 
@@ -90,7 +90,7 @@ class AndroidArtifact:
         if self.path.suffix.lower() not in _ARCHIVE_SUFFIXES:
             raise ReversingMcpError(
                 "unsupported_format",
-                f"Expected an APK, XAPK, APKS, or ZIP: {self.path}",
+                f"Expected an APK, XAPK, APKS, AAB, or ZIP: {self.path}",
             )
         if not zipfile.is_zipfile(self.path):
             raise ReversingMcpError(
@@ -538,6 +538,12 @@ class AndroidArtifact:
             "evidence": evidence[:100],
             "evidence_truncated": len(evidence) > 100,
         }
+
+    def frameworks_detect(self) -> dict[str, Any]:
+        """Run every registered package-framework detector."""
+        from .android_frameworks import detect_android_frameworks
+
+        return detect_android_frameworks(self)
 
 
 def _line_offset(text: str, line: int) -> int:

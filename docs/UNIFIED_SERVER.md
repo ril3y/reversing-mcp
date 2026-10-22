@@ -81,6 +81,10 @@ the unified server or other providers from starting.
   `python install.py --tools capstone --scope user --clients claude,codex`.
   It provides read-only raw-byte and file-region disassembly without an
   analysis database; see [Capstone raw disassembly](CAPSTONE.md).
+- Flutter package inspection has no external dependency. Optional Dart AOT
+  reconstruction uses an explicitly configured Blutter command. Upstream
+  toolchain acquisition is blocked unless explicitly enabled. See
+  [Flutter and Dart AOT](FLUTTER.md).
 - The `protocol` provider has no external dependency or target requirement.
 
 IDA, Ghidra, JADX, and ILSpy still require their corresponding native bridge
@@ -148,3 +152,9 @@ JADX keeps archive and JavaScript operations read-only and removes its owned
 temporary XAPK extraction when the session closes. Bluetooth sessions own a
 live connection but never claim database persistence; transcript files are
 written only by an explicit `ble.transcript.save` operation.
+
+The Flutter provider is also read-only. Its package extraction is session-owned,
+while successful AOT analyzer output is stored in a content-addressed cache so
+later sessions can reuse it. Adding or updating this provider does not require a
+new MCP registration; restart Claude Code and Codex so their server processes
+load the updated checkout.
