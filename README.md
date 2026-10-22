@@ -1,7 +1,8 @@
 # reversing-mcp
 
-One MCP server for reverse engineering with IDA Pro, Ghidra, JADX, ILSpy,
-Binary Ninja, radare2, Capstone, Frida, Bluetooth LE, and offline protocol utilities. It
+One MCP server for reverse engineering with IDA Pro, Ghidra, JADX, Flutter/Dart
+AOT, ILSpy, Binary Ninja, radare2, Capstone, Frida, Bluetooth LE, and offline
+protocol utilities. It
 provides stable session IDs, a common
 capability model, persistent database lifecycle, headless operation, and
 guarded provider-native script execution.
@@ -19,6 +20,7 @@ SessionManager + provider registry
         +-- IDA adapter --------> IDA plugin or owned idat64 process
         +-- Ghidra adapter -----> GUI extension or analyzeHeadless
         +-- JADX adapter -------> owned jadx-core JVM
+        +-- Flutter adapter ----> APK/XAPK/AAB inspector + optional Blutter
         +-- ILSpy adapter ------> owned .NET bridge
         +-- Binary Ninja -------> Python API
         +-- radare2 ------------> r2pipe
@@ -173,6 +175,17 @@ or function, and identify DCloud/uni-app apps, pages, and modules. Temporary
 extractions are removed when the session closes. JADX sessions are intentionally
 read-only. See [JADX provider notes](jadx/PROVIDER.md).
 
+### Flutter and Dart AOT
+
+The `flutter` provider inspects APK, split APK/XAPK, APKS, AAB, and ZIP
+containers without requiring JADX. It detects Flutter packaging, inventories
+ABIs, AOT loading units, assets, plugin candidates, and platform-channel string
+candidates, and safely extracts members. An optional `AotAnalyzer` adapter adds
+cached Dart AOT reconstruction; the first adapter is Blutter and is configured
+explicitly with `BLUTTER_COMMAND`. Upstream toolchain acquisition is blocked
+unless the request or server environment opts in. See
+[Flutter and Dart AOT](docs/FLUTTER.md).
+
 ### Bluetooth LE and protocol analysis
 
 Install the optional Bleak transport into the registered Python environment:
@@ -283,6 +296,9 @@ reversing_mcp/
 |-- registry.py            Provider registration
 |-- manager.py             Lifecycle, policy, persistence, and dispatch
 |-- android_artifacts.py   Nested APK/XAPK and bundled JavaScript analysis
+|-- android_frameworks.py  Extensible Android framework detector registry
+|-- flutter_artifacts.py   Flutter package and asset inspection
+|-- dart_aot.py            Pluggable AOT analyzers and persistent result cache
 |-- capstone_engine.py     Architecture/mode normalization and decoding
 |-- protocols.py           Checksums, Modbus RTU, and register maps
 |-- server.py              Unified FastMCP surface
@@ -290,6 +306,7 @@ reversing_mcp/
     |-- local_bridges.py   IDA, Ghidra, and JADX adapters
     |-- ilspy.py           ILSpy read-only bridge adapter
     |-- frida.py           Frida dynamic instrumentation adapter
+    |-- flutter.py         Flutter package and Dart AOT orchestration
     |-- binary_ninja.py    Binary Ninja adapter
     |-- bluetooth_le.py    Bleak transport and transcript capture
     |-- capstone.py        Lightweight raw-byte disassembly provider
